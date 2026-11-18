@@ -24,11 +24,6 @@ jobs:
         run: |
           flutter create --org com.mimusica --platforms android temp_project
           cp -r temp_project/android .
-          cp -r temp_project/ios .
-          cp -r temp_project/web .
-          cp -r temp_project/linux .
-          cp -r temp_project/macos .
-          cp -r temp_project/windows .
           rm -rf temp_project
 
       - name: Configurar SDK de Android
