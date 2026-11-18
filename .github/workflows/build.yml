@@ -7,6 +7,7 @@ on:
 
 jobs:
   build:
+  #[cite: 5]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -32,14 +33,13 @@ jobs:
       - name: Instalar paquetes
         run: flutter pub add just_audio:^0.9.40 just_audio_background on_audio_query_forked on_audio_query_android image_picker path_provider shared_preferences
 
-      - name: Copiar mis archivos
+      - name: Copiar código principal
         run: |
           cp main.dart lib/main.dart
-          cp AndroidManifest.xml android/app/src/main/AndroidManifest.xml
 
-      - name: Limpiar Manifest antiguo a fondo
+      - name: Inyectar permisos de audio en el Manifest limpio
         run: |
-          sed -i -E 's/package="[^"]*"//g' android/app/src/main/AndroidManifest.xml
+          sed -i '/<application/i \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.WAKE_LOCK"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO"/>' android/app/src/main/AndroidManifest.xml
 
       - name: Crear APK
         run: flutter build apk --release --target-platform android-arm,android-arm64
