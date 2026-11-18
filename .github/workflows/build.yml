@@ -65,19 +65,18 @@ jobs:
         run: |
           cp main.dart lib/main.dart
 
-      - name: Actualizar plataforma Android a la versión actual de Flutter
+      - name: Actualizar plataforma Android y limpiar estructura
         run: |
           rm -rf android
           flutter create . --platforms android --template=app
 
-      - name: Configurar SDK de Android nuevamente en la nueva estructura
+      - name: Reconfigurar SDK y compatibilidad moderna de Gradle
         run: |
           echo "flutter.compileSdkVersion=34" >> android/local.properties
           echo "flutter.minSdkVersion=21" >> android/local.properties
           echo "flutter.targetSdkVersion=34" >> android/local.properties
-
-      - name: Sincronizar compatibilidad de Java y Kotlin en Gradle
-        run: |
+          
+          # Inyectar compatibilidad de Java y Kotlin
           echo "subprojects {
               afterEvaluate { project ->
                   if (project.hasProperty('android')) {
@@ -90,6 +89,7 @@ jobs:
                   }
               }
           }" >> android/build.gradle
+          
           echo "tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
               kotlinOptions {
                   jvmTarget = '17'
