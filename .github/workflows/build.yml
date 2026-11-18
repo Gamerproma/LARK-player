@@ -37,9 +37,12 @@ jobs:
           cp main.dart lib/main.dart
           cp AndroidManifest.xml android/app/src/main/AndroidManifest.xml
 
-      - name: Asegurar Namespace en Gradle
+      - name: Limpiar y sincronizar Manifest
         run: |
-          echo 'android { namespace "com.mimusica.mi_musica" }' >> android/app/build.gradle
+          sed -i 's/package="[^"]*"/package="com.mimusica.mi_musica"/g' android/app/src/main/AndroidManifest.xml
+          if ! grep -q "package=" android/app/src/main/AndroidManifest.xml; then
+            sed -i 's/<manifest/<manifest package="com.mimusica.mi_musica"/g' android/app/src/main/AndroidManifest.xml
+          fi
 
       - name: Crear APK
         run: flutter build apk --release --target-platform android-arm,android-arm64
