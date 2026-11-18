@@ -37,7 +37,7 @@ jobs:
         run: |
           cp main.dart lib/main.dart
 
-      - name: Sincronizar compatibilidad de Java y Kotlin en Gradle
+      - name: Sincronizar compatibilidad de Java, Kotlin y Gradle
         run: |
           echo "subprojects {
               afterEvaluate { project ->
@@ -56,12 +56,10 @@ jobs:
                   jvmTarget = '17'
               }
           }" >> android/app/build.gradle
-
-      - name: Forzar actualización de archivos gradle de la plantilla
-        run: flutter create . --platforms android --overwrite
+          echo "org.gradle.jvmargs=-Xmx4G -XX:+HeapDumpOnOutOfMemoryError" >> android/gradle.properties
 
       - name: Crear APK
-        run: flutter build apk --release --target-platform android-arm,android-arm64
+        run: flutter build apk --release --target-platform android-arm,android-arm64 --no-pub
 
       - uses: actions/upload-artifact@v4
         with:
