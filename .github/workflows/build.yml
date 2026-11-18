@@ -37,13 +37,6 @@ jobs:
           cp main.dart lib/main.dart
           cp AndroidManifest.xml android/app/src/main/AndroidManifest.xml
 
-      - name: Fijar Namespace en Gradle
-        run: |
-          sed -i 's/namespace "com.mimusica.mi_musica"/namespace "com.mimusica.mi_musica"/g' android/app/build.gradle
-          if ! grep -q "namespace" android/app/build.gradle; then
-            echo 'android { namespace "com.mimusica.mi_musica" }' >> android/app/build.gradle
-          fi
-
       - name: Crear APK
         run: flutter build apk --release --target-platform android-arm,android-arm64
 
