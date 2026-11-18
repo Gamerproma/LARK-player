@@ -65,6 +65,17 @@ jobs:
         run: |
           cp main.dart lib/main.dart
 
+      - name: Actualizar plataforma Android a la versión actual de Flutter
+        run: |
+          rm -rf android
+          flutter create . --platforms android --template=app
+
+      - name: Configurar SDK de Android nuevamente en la nueva estructura
+        run: |
+          echo "flutter.compileSdkVersion=34" >> android/local.properties
+          echo "flutter.minSdkVersion=21" >> android/local.properties
+          echo "flutter.targetSdkVersion=34" >> android/local.properties
+
       - name: Sincronizar compatibilidad de Java y Kotlin en Gradle
         run: |
           echo "subprojects {
@@ -85,7 +96,7 @@ jobs:
               }
           }" >> android/app/build.gradle
 
-      - name: Crear APK omitiendo alertas de Gradle
+      - name: Crear APK definitivo
         env:
           CI: "true"
         run: flutter build apk --release --target-platform android-arm,android-arm64
