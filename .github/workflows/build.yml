@@ -37,6 +37,10 @@ jobs:
           cp main.dart lib/main.dart
           cp AndroidManifest.xml android/app/src/main/AndroidManifest.xml
 
+      - name: Parchear Namespace para Gradle
+        run: |
+          echo 'android { namespace "com.mimusica.mi_musica" }' >> android/app/build.gradle
+
       - name: Crear APK
         run: flutter build apk --release --target-platform android-arm,android-arm64
 
