@@ -1,4 +1,3 @@
-
 name: Crear APK
 
 on:
@@ -23,12 +22,14 @@ jobs:
 
       - name: Crear proyecto base
         run: flutter create --org com.mimusica --project-name mi_musica --platforms android .
+
       - name: Configurar SDK de Android
         run: |
           echo "flutter.compileSdkVersion=34" >> android/local.properties
           echo "flutter.minSdkVersion=21" >> android/local.properties
           echo "flutter.targetSdkVersion=34" >> android/local.properties
           echo "android.namespace=com.mimusica.lark_player" >> android/local.properties
+
       - name: Instalar paquetes
         run: flutter pub add just_audio:^0.9.40 just_audio_background on_audio_query_forked on_audio_query_android image_picker path_provider shared_preferences
 
@@ -36,11 +37,11 @@ jobs:
         run: |
           cp main.dart lib/main.dart
           cp AndroidManifest.xml android/app/src/main/AndroidManifest.xml
-          
-          - name: Crear APK
-          run: flutter build apk --release --target-platform android-arm,android-arm64
 
-          - uses: actions/upload-artifact@v4
-          with:
+      - name: Crear APK
+        run: flutter build apk --release --target-platform android-arm,android-arm64
+
+      - uses: actions/upload-artifact@v4
+        with:
           name: mi-musica-apk
           path: build/app/outputs/flutter-apk/app-release.apk
