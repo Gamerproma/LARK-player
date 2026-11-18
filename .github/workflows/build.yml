@@ -36,11 +36,10 @@ jobs:
         run: |
           cp main.dart lib/main.dart
           cp AndroidManifest.xml android/app/src/main/AndroidManifest.xml
+          - name: Crear APK
+          run: flutter build apk --release --target-platform android-arm,android-arm64
 
-      - name: Crear APK
-        run: flutter build apk --release
-
-      - uses: actions/upload-artifact@v4
-        with:
+          - uses: actions/upload-artifact@v4
+          with:
           name: mi-musica-apk
           path: build/app/outputs/flutter-apk/app-release.apk
