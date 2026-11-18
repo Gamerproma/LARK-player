@@ -24,7 +24,9 @@ jobs:
       - name: Crear proyecto base
         run: flutter create --org com.mimusica --project-name mi_musica --platforms android .
       - name: Configurar SDK de Android
-        run: echo "flutter.compileSdkVersion=34" >> android/local.properties
+        run: |
+          echo "flutter.compileSdkVersion=34" >> android/local.properties
+          echo "flutter.minSdkVersion=21" >> android/local.properties
       - name: Instalar paquetes
         run: flutter pub add just_audio:^0.9.40 just_audio_background on_audio_query_forked image_picker path_provider shared_preferences
 
