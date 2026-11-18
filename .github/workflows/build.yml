@@ -24,7 +24,7 @@ jobs:
         run: flutter create --org com.mimusica --project-name mi_musica --platforms android .
 
       - name: Instalar paquetes
-        run: flutter pub add just_audio:^0.9.40 just_audio_background on_audio_query_forked image_picker path_provider shared_preferences
+        run: flutter pub add just_audio:^0.9.40 just_audio_background on_audio_query_forked image_picker path_provider shared_preferences photo_manager video_player share_plus:^10.1.4 webview_flutter app_settings:^5.1.1
 
       - name: Subir version de Android en piezas viejas
         run: |
