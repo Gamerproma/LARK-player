@@ -37,9 +37,9 @@ jobs:
           cp main.dart lib/main.dart
           cp AndroidManifest.xml android/app/src/main/AndroidManifest.xml
 
-      - name: Limpiar Manifest antiguo
+      - name: Limpiar Manifest antiguo a fondo
         run: |
-          sed -i 's/package="[^"]*"/ /g' android/app/src/main/AndroidManifest.xml
+          sed -i -E 's/package="[^"]*"//g' android/app/src/main/AndroidManifest.xml
 
       - name: Crear APK
         run: flutter build apk --release --target-platform android-arm,android-arm64
