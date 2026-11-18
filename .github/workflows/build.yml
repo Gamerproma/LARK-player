@@ -29,9 +29,36 @@ jobs:
           echo "flutter.minSdkVersion=21" >> android/local.properties
           echo "flutter.targetSdkVersion=34" >> android/local.properties
 
-      - name: Inyectar dependencias limpias en pubspec
+      - name: Escribir pubspec.yaml limpio con dependencias
         run: |
-          sed -i '/dependencies:/a \  just_audio: ^0.9.40\n  just_audio_background:\n  on_audio_query_forked:\n  on_audio_query_android:\n  image_picker:\n  path_provider:\n  shared_preferences:' pubspec.yaml
+          cat << 'EOF' > pubspec.yaml
+          name: mi_musica
+          description: "A new Flutter project."
+          publish_to: "none"
+          version: 1.0.0+1
+
+          environment:
+            sdk: '>=3.0.0 <4.0.0'
+
+          dependencies:
+            flutter:
+              sdk: flutter
+            just_audio: ^0.9.40
+            just_audio_background: ^0.0.1-beta.14
+            on_audio_query_forked: ^2.9.1
+            on_audio_query_android: ^2.0.1
+            image_picker: ^1.0.7
+            path_provider: ^2.1.2
+            shared_preferences: ^2.2.2
+
+          dev_dependencies:
+            flutter_test:
+              sdk: flutter
+            flutter_lints: ^3.0.0
+
+          flutter:
+            uses-material-design: true
+          EOF
           flutter pub get
 
       - name: Copiar código principal
