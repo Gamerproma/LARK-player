@@ -26,6 +26,13 @@ jobs:
       - name: Instalar paquetes
         run: flutter pub add just_audio:^0.9.40 just_audio_background on_audio_query_forked image_picker path_provider shared_preferences
 
+      - name: Subir version de Android en piezas viejas
+        run: |
+          CACHE="${PUB_CACHE:-$HOME/.pub-cache}"
+          find "$CACHE/hosted" \( -name "build.gradle" -o -name "build.gradle.kts" \) | while read f; do
+            sed -i -E 's/(compileSdk(Version)?[[:space:]]*=?[[:space:]]*)(2[0-9]|3[0-4])\b/\1 35/' "$f"
+          done
+
       - name: Copiar mis archivos
         run: |
           cp main.dart lib/main.dart
