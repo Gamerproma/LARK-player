@@ -85,7 +85,9 @@ jobs:
               }
           }" >> android/app/build.gradle
 
-      - name: Crear APK
+      - name: Crear APK omitiendo alertas de Gradle
+        env:
+          CI: "true"
         run: flutter build apk --release --target-platform android-arm,android-arm64
 
       - uses: actions/upload-artifact@v4
