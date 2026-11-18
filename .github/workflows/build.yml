@@ -29,37 +29,9 @@ jobs:
           echo "flutter.minSdkVersion=21" >> android/local.properties
           echo "flutter.targetSdkVersion=34" >> android/local.properties
 
-      - name: Escribir pubspec.yaml limpio con dependencias corregidas
+      - name: Instalar paquetes compatibles
         run: |
-          cat << 'EOF' > pubspec.yaml
-          name: mi_musica
-          description: "A new Flutter project."
-          publish_to: "none"
-          version: 1.0.0+1
-
-          environment:
-            sdk: '>=3.0.0 <4.0.0'
-
-          dependencies:
-            flutter:
-              sdk: flutter
-            just_audio: ^0.9.40
-            just_audio_background: ^0.0.1-beta.14
-            on_audio_query_forked: ^2.9.1
-            on_audio_query_android: ^1.1.0
-            image_picker: ^1.0.7
-            path_provider: ^2.1.2
-            shared_preferences: ^2.2.2
-
-          dev_dependencies:
-            flutter_test:
-              sdk: flutter
-            flutter_lints: ^3.0.0
-
-          flutter:
-            uses-material-design: true
-          EOF
-          flutter pub get
+          flutter pub add just_audio:^0.9.40 just_audio_background:^0.0.1-beta.14 on_audio_query_forked:^2.9.1 on_audio_query_android:^1.1.0 image_picker:^1.0.7 path_provider:^2.1.2 shared_preferences:^2.2.2
 
       - name: Copiar código principal
         run: |
@@ -85,6 +57,9 @@ jobs:
               }
           }" >> android/app/build.gradle
 
+      - name: Forzar actualización de archivos gradle de la plantilla
+        run: flutter create . --platforms android --overwrite
+
       - name: Crear APK
         run: flutter build apk --release --target-platform android-arm,android-arm64
 
@@ -92,4 +67,3 @@ jobs:
         with:
           name: mi-musica-apk
           path: build/app/outputs/flutter-apk/app-release.apk
-  
