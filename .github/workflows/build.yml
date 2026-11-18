@@ -29,8 +29,10 @@ jobs:
           echo "flutter.minSdkVersion=21" >> android/local.properties
           echo "flutter.targetSdkVersion=34" >> android/local.properties
 
-      - name: Instalar paquetes
-        run: flutter pub add just_audio:^0.9.40 just_audio_background on_audio_query_forked on_audio_query_android image_picker path_provider shared_preferences
+      - name: Inyectar dependencias limpias en pubspec
+        run: |
+          sed -i '/dependencies:/a \  just_audio: ^0.9.40\n  just_audio_background:\n  on_audio_query_forked:\n  on_audio_query_android:\n  image_picker:\n  path_provider:\n  shared_preferences:' pubspec.yaml
+          flutter pub get
 
       - name: Copiar código principal
         run: |
@@ -57,7 +59,7 @@ jobs:
           }" >> android/app/build.gradle
 
       - name: Crear APK
-        run: flutter build apk --release --target-platform android-arm,android-arm64 --no-pub
+        run: flutter build apk --release --target-platform android-arm,android-arm64
 
       - uses: actions/upload-artifact@v4
         with:
