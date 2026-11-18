@@ -29,15 +29,43 @@ jobs:
           echo "flutter.minSdkVersion=21" >> android/local.properties
           echo "flutter.targetSdkVersion=34" >> android/local.properties
 
-      - name: Instalar paquetes compatibles
+      - name: Escribir pubspec.yaml completo con dependencias
         run: |
-          flutter pub add just_audio:^0.9.40 just_audio_background:^0.0.1-beta.14 on_audio_query_forked:^2.9.1 on_audio_query_android:^1.1.0 image_picker:^1.0.7 path_provider:^2.1.2 shared_preferences:^2.2.2
+          cat << 'EOF' > pubspec.yaml
+          name: mi_musica
+          description: "A new Flutter project."
+          publish_to: "none"
+          version: 1.0.0+1
+
+          environment:
+            sdk: '>=3.0.0 <4.0.0'
+
+          dependencies:
+            flutter:
+              sdk: flutter
+            just_audio: ^0.9.40
+            just_audio_background: ^0.0.1-beta.14
+            on_audio_query_forked: ^2.9.1
+            on_audio_query_android: ^1.1.0
+            image_picker: ^1.0.7
+            path_provider: ^2.1.2
+            shared_preferences: ^2.2.2
+
+          dev_dependencies:
+            flutter_test:
+              sdk: flutter
+            flutter_lints: ^3.0.0
+
+          flutter:
+            uses-material-design: true
+          EOF
+          flutter pub get
 
       - name: Copiar código principal
         run: |
           cp main.dart lib/main.dart
 
-      - name: Sincronizar compatibilidad de Java, Kotlin y Gradle
+      - name: Sincronizar compatibilidad de Java y Kotlin en Gradle
         run: |
           echo "subprojects {
               afterEvaluate { project ->
@@ -56,10 +84,9 @@ jobs:
                   jvmTarget = '17'
               }
           }" >> android/app/build.gradle
-          echo "org.gradle.jvmargs=-Xmx4G -XX:+HeapDumpOnOutOfMemoryError" >> android/gradle.properties
 
       - name: Crear APK
-        run: flutter build apk --release --target-platform android-arm,android-arm64 --no-pub
+        run: flutter build apk --release --target-platform android-arm,android-arm64
 
       - uses: actions/upload-artifact@v4
         with:
