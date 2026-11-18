@@ -20,11 +20,9 @@ jobs:
         with:
           channel: stable
 
-      - name: Crear proyecto Flutter limpio en carpeta temporal
+      - name: Crear proyecto Flutter completo y limpio
         run: |
-          flutter create --org com.mimusica --platforms android temp_project
-          cp -r temp_project/android .
-          rm -rf temp_project
+          flutter create --org com.mimusica --project-name mi_musica --platforms android .
 
       - name: Configurar SDK de Android
         run: |
@@ -32,41 +30,12 @@ jobs:
           echo "flutter.minSdkVersion=21" >> android/local.properties
           echo "flutter.targetSdkVersion=34" >> android/local.properties
 
-      - name: Escribir pubspec.yaml completo con dependencias
+      - name: Instalar dependencias mediante pub add
         run: |
-          cat << 'EOF' > pubspec.yaml
-          name: mi_musica
-          description: "A new Flutter project."
-          publish_to: "none"
-          version: 1.0.0+1
-
-          environment:
-            sdk: '>=3.0.0 <4.0.0'
-
-          dependencies:
-            flutter:
-              sdk: flutter
-            just_audio: ^0.9.40
-            just_audio_background: ^0.0.1-beta.14
-            on_audio_query_forked: ^2.9.1
-            on_audio_query_android: ^1.1.0
-            image_picker: ^1.0.7
-            path_provider: ^2.1.2
-            shared_preferences: ^2.2.2
-
-          dev_dependencies:
-            flutter_test:
-              sdk: flutter
-            flutter_lints: ^3.0.0
-
-          flutter:
-            uses-material-design: true
-          EOF
-          flutter pub get
+          flutter pub add just_audio:^0.9.40 just_audio_background:^0.0.1-beta.14 on_audio_query_forked:^2.9.1 on_audio_query_android:^1.1.0 image_picker:^1.0.7 path_provider:^2.1.2 shared_preferences:^2.2.2
 
       - name: Copiar código principal
         run: |
-          mkdir -p lib
           cp main.dart lib/main.dart
 
       - name: Sincronizar compatibilidad de Java y Kotlin en Gradle
