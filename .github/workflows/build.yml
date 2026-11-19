@@ -20,18 +20,37 @@ jobs:
         with:
           channel: stable
 
+      - name: Aceptar licencias de Android
+        run: yes | flutter doctor --android-licenses || true
+
       - name: Crear proyecto base
         run: flutter create --org com.mimusica --project-name mi_musica --platforms android .
 
       - name: Instalar paquetes
         run: flutter pub add just_audio:^0.9.40 just_audio_background on_audio_query_forked image_picker path_provider shared_preferences photo_manager video_player share_plus:^10.1.4 webview_flutter app_settings:^5.1.1 permission_handler
 
-      - name: Subir version de Android en piezas viejas
+      - name: Subir version de Android a 37 (piezas y app)
         run: |
-          CACHE="${PUB_CACHE:-$HOME/.pub-cache}"
-          find "$CACHE/hosted" \( -name "build.gradle" -o -name "build.gradle.kts" \) | while read f; do
-            sed -i -E 's/(compileSdk(Version)?[[:space:]]*=?[[:space:]]*)(2[0-9]|3[0-4])\b/\1 35/' "$f"
-          done
+          python3 - <<'PY'
+          import os, re, glob
+          cache = os.environ.get("PUB_CACHE") or os.path.expanduser("~/.pub-cache")
+          files = glob.glob(cache + "/hosted/**/build.gradle*", recursive=True)
+          files += glob.glob("android/**/build.gradle*", recursive=True)
+          pat = re.compile(r'(compileSdk(?:Version)?\s*=?\s*)(\d+)(?!\d)')
+          pat2 = re.compile(r'(compileSdk(?:Version)?\s*=?\s*)flutter\.compileSdkVersion')
+          pat3 = re.compile(r'(version\s*=\s*release\()(\d+)(\))')
+          for f in files:
+              try:
+                  s = open(f).read()
+              except Exception:
+                  continue
+              n = pat.sub(lambda m: m.group(1) + ('37' if int(m.group(2)) < 37 else m.group(2)), s)
+              n = pat2.sub(lambda m: m.group(1) + '37', n)
+              n = pat3.sub(lambda m: m.group(1) + ('37' if int(m.group(2)) < 37 else m.group(2)) + m.group(3), n)
+              if n != s:
+                  open(f, 'w').write(n)
+                  print("ok", f)
+          PY
 
       - name: Apagar la revision lint que se cae
         run: |
