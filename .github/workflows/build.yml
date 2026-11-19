@@ -27,7 +27,7 @@ jobs:
         run: flutter create --org com.mimusica --project-name mi_musica --platforms android .
 
       - name: Instalar paquetes
-        run: flutter pub add just_audio:^0.9.40 just_audio_background on_audio_query_forked image_picker path_provider shared_preferences photo_manager video_player share_plus:^10.1.4 webview_flutter app_settings:^5.1.1 permission_handler
+        run: flutter pub add just_audio:^0.9.40 audio_service on_audio_query_forked image_picker path_provider shared_preferences photo_manager video_player share_plus:^10.1.4 webview_flutter app_settings:^5.1.1 permission_handler url_launcher
 
       - name: Subir version de Android a 37 (piezas y app)
         run: |
@@ -65,13 +65,30 @@ jobs:
           }
           EOF
 
-      - name: Poner el icono de Play Music
+      - name: Icono de la app y de la notificacion
         run: |
           if [ -f icon.png ]; then
             for d in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
               cp icon.png android/app/src/main/res/mipmap-$d/ic_launcher.png
             done
           fi
+          mkdir -p android/app/src/main/res/drawable android/app/src/main/res/raw
+          cat > android/app/src/main/res/drawable/ic_notification.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+            <path
+                android:fillColor="#FFFFFFFF"
+                android:pathData="M12,3v10.55c-0.59,-0.34 -1.27,-0.55 -2,-0.55 -2.21,0 -4,1.79 -4,4s1.79,4 4,4 4,-1.79 4,-4V7h4V3h-6z"/>
+          </vector>
+          EOF
+          cat > android/app/src/main/res/raw/keep.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources xmlns:tools="http://schemas.android.com/tools"
+              tools:keep="@drawable/ic_notification,@mipmap/ic_launcher" />
+          EOF
 
       - name: Copiar mis archivos
         run: |
@@ -83,5 +100,5 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: mi-musica-apk
+          name: play-music-apk
           path: build/app/outputs/flutter-apk/app-release.apk
