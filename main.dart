@@ -5,29 +5,130 @@ import 'dart:math';
 import 'dart:ui' as ui;
 
 import 'package:app_settings/app_settings.dart';
+import 'package:audio_service/audio_service.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:just_audio/just_audio.dart';
-import 'package:just_audio_background/just_audio_background.dart';
 import 'package:on_audio_query_forked/on_audio_query.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart' as ph;
 import 'package:photo_manager/photo_manager.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'package:video_player/video_player.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
+late PlayMusicHandler audioHandler;
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await JustAudioBackground.init(
-    androidNotificationChannelId: 'com.mimusica.audio',
-    androidNotificationChannelName: 'Play Music',
-    androidNotificationOngoing: true,
-  );
   await ctrl.init();
+  audioHandler = await AudioService.init(
+    builder: () => PlayMusicHandler(ctrl.player, ctrl.artFile),
+    config: AudioServiceConfig(
+      androidNotificationChannelId: 'com.mimusica.audio',
+      androidNotificationChannelName: 'Play Music',
+      androidNotificationChannelDescription:
+          'Controles de reproducción de Play Music',
+      androidNotificationOngoing: true,
+      androidStopForegroundOnPause: true,
+      androidNotificationIcon: 'drawable/ic_notification',
+      androidShowNotificationBadge: true,
+    ),
+  );
   runApp(const PlayMusicApp());
+}
+
+// ===========================================================================
+// SESIÓN MULTIMEDIA DE ANDROID (notificación, pantalla de bloqueo, auriculares)
+// ===========================================================================
+class PlayMusicHandler extends BaseAudioHandler {
+  final AudioPlayer _p;
+  final Future<String?> Function(int msId) _artFile;
+  List<MediaItem> _items = [];
+
+  PlayMusicHandler(this._p, this._artFile) {
+    _p.playbackEventStream.listen((_) => _emit());
+    _p.playingStream.listen((_) => _emit());
+    _p.currentIndexStream.listen(_onIndex);
+    _p.durationStream.listen((d) {
+      final i = _p.currentIndex;
+      if (i == null || i >= _items.length || d == null) return;
+      _items[i] = _items[i].copyWith(duration: d);
+      mediaItem.add(_items[i]);
+    });
+  }
+
+  /// Le pasa a Android la lista de canciones que están en la cola.
+  void setItems(List<MediaItem> items) {
+    _items = List.of(items);
+    queue.add(_items);
+  }
+
+  void _emit() => playbackState.add(_state());
+
+  PlaybackState _state() {
+    return PlaybackState(
+      controls: [
+        MediaControl.skipToPrevious,
+        if (_p.playing) MediaControl.pause else MediaControl.play,
+        MediaControl.skipToNext,
+      ],
+      systemActions: const {MediaAction.seek},
+      androidCompactActionIndices: const [0, 1, 2],
+      processingState: const {
+        ProcessingState.idle: AudioProcessingState.idle,
+        ProcessingState.loading: AudioProcessingState.loading,
+        ProcessingState.buffering: AudioProcessingState.buffering,
+        ProcessingState.ready: AudioProcessingState.ready,
+        ProcessingState.completed: AudioProcessingState.completed,
+      }[_p.processingState]!,
+      playing: _p.playing,
+      updatePosition: _p.position,
+      bufferedPosition: _p.bufferedPosition,
+      speed: _p.speed,
+      queueIndex: _p.currentIndex,
+    );
+  }
+
+  void _onIndex(int? i) {
+    if (i == null || i >= _items.length) return;
+    mediaItem.add(_items[i]);
+    _loadArt(i);
+    _emit();
+  }
+
+  /// Guarda la carátula en un archivo temporal para mostrarla en la notificación.
+  Future<void> _loadArt(int i) async {
+    final item = _items[i];
+    final id = item.extras?['msId'];
+    if (id is! int || item.artUri != null) return;
+    final path = await _artFile(id);
+    if (path == null || i >= _items.length || _items[i].id != item.id) return;
+    _items[i] = _items[i].copyWith(artUri: Uri.file(path));
+    if (_p.currentIndex == i) mediaItem.add(_items[i]);
+  }
+
+  @override
+  Future<void> play() => _p.play();
+  @override
+  Future<void> pause() => _p.pause();
+  @override
+  Future<void> seek(Duration position) => _p.seek(position);
+  @override
+  Future<void> skipToNext() => _p.seekToNext();
+  @override
+  Future<void> skipToPrevious() => _p.seekToPrevious();
+  @override
+  Future<void> skipToQueueItem(int index) =>
+      _p.seek(Duration.zero, index: index);
+  @override
+  Future<void> stop() async {
+    await _p.stop();
+    return super.stop();
+  }
 }
 
 // ===========================================================================
@@ -125,50 +226,63 @@ Lyrics? parseLyrics(String raw) {
   return null;
 }
 
-/// Saca el color más llamativo de una carátula (para el tema dinámico).
+/// Saca el color más llamativo de una carátula y lo hace vibrante
+/// (sin grises ni tonos oscuros) para el tema dinámico.
 Future<Color?> dominantColor(Uint8List bytes) async {
   try {
-    final codec = await ui.instantiateImageCodec(bytes, targetWidth: 48);
+    final codec = await ui.instantiateImageCodec(bytes, targetWidth: 56);
     final frame = await codec.getNextFrame();
     final data =
         await frame.image.toByteData(format: ui.ImageByteFormat.rawRgba);
     frame.image.dispose();
     if (data == null) return null;
-    final buckets = <int, List<double>>{};
+    const bins = 36; // grupos de 10 grados de tono
+    final score = List<double>.filled(bins, 0);
+    final hues = <double>[];
+    final sats = <double>[];
+    final lights = <double>[];
+    final weights = <double>[];
     for (var i = 0; i + 3 < data.lengthInBytes; i += 4) {
-      final r = data.getUint8(i);
-      final g = data.getUint8(i + 1);
-      final b = data.getUint8(i + 2);
-      final a = data.getUint8(i + 3);
-      if (a < 200) continue;
-      final mx = max(r, max(g, b));
-      final mn = min(r, min(g, b));
-      final v = mx / 255;
-      final s = mx == 0 ? 0.0 : (mx - mn) / mx;
-      if (v < 0.18 || (v > 0.95 && s < 0.1)) continue;
-      final key = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
-      final e = buckets.putIfAbsent(key, () => [0, 0, 0, 0]);
-      e[0] += 1;
-      e[1] += r;
-      e[2] += g;
-      e[3] += b;
+      if (data.getUint8(i + 3) < 200) continue;
+      final c = HSLColor.fromColor(Color.fromARGB(
+          255, data.getUint8(i), data.getUint8(i + 1), data.getUint8(i + 2)));
+      final s = c.saturation;
+      final l = c.lightness;
+      if (l < 0.12 || l > 0.94 || s < 0.15) continue; // fuera grises y extremos
+      final w = (0.15 + s) * (1.0 - (l - 0.5).abs());
+      hues.add(c.hue);
+      sats.add(s);
+      lights.add(l);
+      weights.add(w);
+      score[(c.hue / 10).floor() % bins] += w;
     }
-    if (buckets.isEmpty) return null;
-    double best = -1;
-    Color? out;
-    for (final e in buckets.values) {
-      final n = e[0];
-      final r = e[1] / n, g = e[2] / n, b = e[3] / n;
-      final mx = max(r, max(g, b));
-      final mn = min(r, min(g, b));
-      final s = mx == 0 ? 0.0 : (mx - mn) / mx;
-      final score = n * (0.25 + s);
-      if (score > best) {
-        best = score;
-        out = Color.fromARGB(255, r.round(), g.round(), b.round());
+    if (hues.length < 12) return null; // carátula casi gris: se usa el acento
+    var best = 0;
+    var bestScore = -1.0;
+    for (var b = 0; b < bins; b++) {
+      final sc = score[b] +
+          0.6 * (score[(b + 1) % bins] + score[(b + bins - 1) % bins]);
+      if (sc > bestScore) {
+        bestScore = sc;
+        best = b;
       }
     }
-    return out;
+    final center = best * 10 + 5.0;
+    double sw = 0, dh = 0, ss = 0, sl = 0;
+    for (var i = 0; i < hues.length; i++) {
+      final d = ((hues[i] - center + 540) % 360) - 180;
+      if (d.abs() > 20) continue;
+      final w = weights[i];
+      sw += w;
+      dh += d * w;
+      ss += sats[i] * w;
+      sl += lights[i] * w;
+    }
+    if (sw == 0) return null;
+    final hue = (center + dh / sw + 360) % 360;
+    final sat = (ss / sw * 1.3).clamp(0.6, 0.95).toDouble();
+    final light = (sl / sw).clamp(0.42, 0.58).toDouble();
+    return HSLColor.fromAHSL(1.0, hue, sat, light).toColor();
   } catch (_) {
     return null;
   }
@@ -210,6 +324,11 @@ class Controller extends ChangeNotifier {
   int minSeconds = 30;
   double speed = 1.0;
   String sortMode = 'az';
+  double dynIntensity = 0.75;
+  int bgDim = 40;
+  bool notifOk = true;
+  bool notifBannerHidden = false;
+  List<Map<String, String>> sites = [];
   DateTime? sleepEnd;
   Timer? _sleep;
 
@@ -230,6 +349,15 @@ class Controller extends ChangeNotifier {
     minSeconds = prefs.getInt('minSeconds') ?? 30;
     speed = prefs.getDouble('speed') ?? 1.0;
     sortMode = prefs.getString('sort') ?? 'az';
+    dynIntensity = prefs.getDouble('dynIntensity') ?? 0.75;
+    bgDim = prefs.getInt('bgDim') ?? 40;
+    notifBannerHidden = prefs.getBool('notifBanner') ?? false;
+    final st = prefs.getString('sites');
+    if (st != null) {
+      sites = (jsonDecode(st) as List)
+          .map((e) => Map<String, String>.from(e as Map))
+          .toList();
+    }
 
     bgPath = prefs.getString('bg');
     if (bgPath != null && !File(bgPath!).existsSync()) bgPath = null;
@@ -300,6 +428,32 @@ class Controller extends ChangeNotifier {
     }
   }
 
+  /// Guarda la carátula como imagen en la caché y devuelve su ruta.
+  Future<String?> artFile(int msId) async {
+    try {
+      final dir = await getTemporaryDirectory();
+      final f = File('${dir.path}/art_$msId.jpg');
+      if (await f.exists() && await f.length() > 0) return f.path;
+      final b = await art(msId, 600, quality: 95);
+      if (b == null) return null;
+      await f.writeAsBytes(b, flush: true);
+      return f.path;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // Color vibrante listo para usar según la intensidad elegida
+  Color? get glow {
+    final c = coverColor;
+    if (!dynamicTheme || c == null) return null;
+    final h = HSLColor.fromColor(c);
+    final sat = (h.saturation * (0.55 + 0.6 * dynIntensity)).clamp(0.0, 1.0);
+    return h.withSaturation(sat.toDouble()).toColor();
+  }
+
+  int get glowAlpha => (60 + 180 * dynIntensity).round();
+
   int _colorFor = -1;
   Future<void> _updateCover() async {
     final t = current;
@@ -320,12 +474,20 @@ class Controller extends ChangeNotifier {
     notifyListeners();
   }
 
-  // ----- Permisos de notificación (Android 13+) -----
-  Future<void> requestNotifications() async {
+  // ----- Permiso de notificaciones (Android 13+) -----
+  Future<void> checkNotifications({bool ask = false}) async {
     try {
-      final s = await ph.Permission.notification.status;
-      if (!s.isGranted) await ph.Permission.notification.request();
+      var s = await ph.Permission.notification.status;
+      if (!s.isGranted && ask) s = await ph.Permission.notification.request();
+      notifOk = s.isGranted;
     } catch (_) {}
+    notifyListeners();
+  }
+
+  void hideNotifBanner() {
+    notifBannerHidden = true;
+    prefs.setBool('notifBanner', true);
+    notifyListeners();
   }
 
   // ----- Biblioteca -----
@@ -442,20 +604,17 @@ class Controller extends ChangeNotifier {
   Future<void> playList(List<Track> list, int index) async {
     if (list.isEmpty) return;
     queue = List.of(list);
-    final sources = queue
-        .map((t) => AudioSource.uri(
-              Uri.parse(t.uri),
-              tag: MediaItem(
-                id: '${t.id}',
-                title: t.title,
-                artist: t.artist,
-                artUri: t.albumId != null
-                    ? Uri.parse(
-                        'content://media/external/audio/albumart/${t.albumId}')
-                    : null,
-              ),
+    audioHandler.setItems(queue
+        .map((t) => MediaItem(
+              id: '${t.id}',
+              title: t.title,
+              artist: t.artist,
+              duration:
+                  t.durationMs > 0 ? Duration(milliseconds: t.durationMs) : null,
+              extras: {'msId': t.msId},
             ))
-        .toList();
+        .toList());
+    final sources = queue.map((t) => AudioSource.uri(Uri.parse(t.uri))).toList();
     try {
       await player.setAudioSource(
         ConcatenatingAudioSource(children: sources),
@@ -599,6 +758,32 @@ class Controller extends ChangeNotifier {
   void setDynamic(bool v) {
     dynamicTheme = v;
     prefs.setBool('dynamic', v);
+    notifyListeners();
+  }
+
+  void setIntensity(double v) {
+    dynIntensity = v;
+    prefs.setDouble('dynIntensity', v);
+    notifyListeners();
+  }
+
+  void setBgDim(int v) {
+    bgDim = v;
+    prefs.setInt('bgDim', v);
+    notifyListeners();
+  }
+
+  // ----- Mis sitios (accesos directos del buscador) -----
+  void addSite(String name, String url) {
+    sites.add({'n': name, 'u': url});
+    prefs.setString('sites', jsonEncode(sites));
+    notifyListeners();
+  }
+
+  void removeSite(int i) {
+    if (i < 0 || i >= sites.length) return;
+    sites.removeAt(i);
+    prefs.setString('sites', jsonEncode(sites));
     notifyListeners();
   }
 
@@ -786,71 +971,6 @@ class Controller extends ChangeNotifier {
     }
   }
 
-  // ----- Descarga por URL (solo enlaces directos a archivos de audio) -----
-  Future<String> downloadUrl(
-      String url, void Function(double?) onProgress) async {
-    final uri = Uri.tryParse(url.trim());
-    if (uri == null || !(uri.scheme == 'http' || uri.scheme == 'https')) {
-      return tr('Ese enlace no es válido.', 'That link is not valid.');
-    }
-    final host = uri.host.toLowerCase();
-    const blocked = [
-      'youtube.com',
-      'youtu.be',
-      'instagram.com',
-      'facebook.com',
-      'fb.watch',
-      'tiktok.com',
-    ];
-    if (blocked.any((b) => host == b || host.endsWith('.$b'))) {
-      return tr(
-        'Esos sitios no permiten descargar su contenido. Usa un enlace directo a un archivo de audio (.mp3, .m4a...).',
-        'Those sites do not allow downloading their content. Use a direct link to an audio file (.mp3, .m4a...).',
-      );
-    }
-    final client = HttpClient();
-    try {
-      final req = await client.getUrl(uri);
-      final res = await req.close();
-      if (res.statusCode != 200) {
-        return tr('El servidor respondió con error ${res.statusCode}.',
-            'The server answered with error ${res.statusCode}.');
-      }
-      final type = res.headers.contentType?.mimeType ?? '';
-      final low = uri.path.toLowerCase();
-      const exts = ['.mp3', '.m4a', '.aac', '.wav', '.ogg', '.flac', '.opus'];
-      final okExt = exts.any((e) => low.endsWith(e));
-      if (!type.startsWith('audio') &&
-          !okExt &&
-          type != 'application/octet-stream') {
-        return tr('Ese enlace no parece ser un archivo de audio.',
-            'That link does not look like an audio file.');
-      }
-      final dir = await downloadsDir();
-      var name = uri.pathSegments.isNotEmpty
-          ? Uri.decodeComponent(uri.pathSegments.last)
-          : 'cancion_${DateTime.now().millisecondsSinceEpoch}.mp3';
-      if (!name.contains('.')) name = '$name.mp3';
-      name = name.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
-      final file = File('${dir.path}/$name');
-      final sink = file.openWrite();
-      var got = 0;
-      final total = res.contentLength;
-      await for (final chunk in res) {
-        sink.add(chunk);
-        got += chunk.length;
-        onProgress(total > 0 ? got / total : null);
-      }
-      await sink.close();
-      await loadSongs();
-      return tr('Listo: $name (revisa la pestaña Canciones)',
-          'Done: $name (check the Songs tab)');
-    } catch (e) {
-      return tr('No se pudo descargar: $e', 'Could not download: $e');
-    } finally {
-      client.close();
-    }
-  }
 }
 
 final ctrl = Controller();
@@ -858,18 +978,18 @@ final ctrl = Controller();
 // ===========================================================================
 // APP Y PANTALLA PRINCIPAL
 // ===========================================================================
+ThemeData buildTheme(Brightness b) {
+  final seed = ctrl.glow ?? accents[ctrl.accent];
+  return ThemeData(
+    useMaterial3: true,
+    colorScheme: ColorScheme.fromSeed(seedColor: seed, brightness: b),
+  );
+}
+
 class PlayMusicApp extends StatelessWidget {
   const PlayMusicApp({super.key});
 
-  ThemeData _theme(Brightness b) {
-    final seed = (ctrl.dynamicTheme && ctrl.coverColor != null)
-        ? ctrl.coverColor!
-        : accents[ctrl.accent];
-    return ThemeData(
-      useMaterial3: true,
-      colorScheme: ColorScheme.fromSeed(seedColor: seed, brightness: b),
-    );
-  }
+  ThemeData _theme(Brightness b) => buildTheme(b);
 
   @override
   Widget build(BuildContext context) {
@@ -912,11 +1032,58 @@ class Root extends StatefulWidget {
   State<Root> createState() => _RootState();
 }
 
-class _RootState extends State<Root> {
+class _RootState extends State<Root> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
-    ctrl.loadSongs().then((_) => ctrl.requestNotifications());
+    WidgetsBinding.instance.addObserver(this);
+    ctrl.loadSongs().then((_) => ctrl.checkNotifications(ask: true));
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) ctrl.checkNotifications();
+  }
+
+  /// Capa de fondo: si hay foto propia, SOLO se le pone una capa oscura
+  /// semitransparente (ajustable). El color dinámico no la tapa.
+  Widget _background(ColorScheme cs) {
+    if (ctrl.bgPath != null) {
+      return Stack(
+        fit: StackFit.expand,
+        children: [
+          Image.file(
+            File(ctrl.bgPath!),
+            fit: BoxFit.cover,
+            filterQuality: FilterQuality.medium,
+            gaplessPlayback: true,
+          ),
+          Container(color: Colors.black.withAlpha((ctrl.bgDim * 2.55).round())),
+        ],
+      );
+    }
+    final g = ctrl.glow;
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 600),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [
+            g != null
+                ? g.withAlpha((ctrl.glowAlpha * 0.75).round())
+                : cs.primary.withAlpha(40),
+            cs.surface,
+          ],
+        ),
+      ),
+    );
   }
 
   @override
@@ -926,87 +1093,77 @@ class _RootState extends State<Root> {
       builder: (context, _) {
         if (ctrl.loading && ctrl.all.isEmpty) return const SplashScreen();
         final cs = Theme.of(context).colorScheme;
-        return Stack(
-          fit: StackFit.expand,
-          children: [
-            if (ctrl.bgPath != null)
-              Image.file(File(ctrl.bgPath!), fit: BoxFit.cover),
-            if (ctrl.bgPath != null)
-              Container(color: cs.surface.withAlpha(150))
-            else
-              AnimatedContainer(
-                duration: const Duration(milliseconds: 600),
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.topCenter,
-                    end: Alignment.bottomCenter,
-                    colors: [
-                      (ctrl.dynamicTheme && ctrl.coverColor != null)
-                          ? ctrl.coverColor!.withAlpha(90)
-                          : cs.primary.withAlpha(40),
-                      cs.surface,
-                    ],
-                  ),
-                ),
-              ),
-            DefaultTabController(
-              length: 5,
-              initialIndex: 1,
-              child: Scaffold(
-                backgroundColor: Colors.transparent,
-                appBar: AppBar(
+        final hasBg = ctrl.bgPath != null;
+        return Theme(
+          // Con foto de fondo se usa el tema oscuro para que el texto se lea bien
+          data: hasBg ? buildTheme(Brightness.dark) : Theme.of(context),
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              _background(cs),
+              DefaultTabController(
+                length: 5,
+                initialIndex: 1,
+                child: Scaffold(
                   backgroundColor: Colors.transparent,
-                  title: Row(
+                  appBar: AppBar(
+                    backgroundColor: Colors.transparent,
+                    surfaceTintColor: Colors.transparent,
+                    scrolledUnderElevation: 0,
+                    title: const Row(
+                      children: [
+                        PlayLogo(size: 30),
+                        SizedBox(width: 10),
+                        Text('Play Music',
+                            style: TextStyle(fontWeight: FontWeight.bold)),
+                      ],
+                    ),
+                    actions: [
+                      IconButton(
+                        icon: const Icon(Icons.search),
+                        tooltip: tr('Buscar', 'Search'),
+                        onPressed: () => Navigator.push(
+                          context,
+                          MaterialPageRoute(builder: (_) => const SearchPage()),
+                        ),
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.settings),
+                        tooltip: tr('Ajustes', 'Settings'),
+                        onPressed: () => Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                              builder: (_) => const SettingsPage()),
+                        ),
+                      ),
+                    ],
+                    bottom: TabBar(
+                      isScrollable: true,
+                      tabAlignment: TabAlignment.start,
+                      dividerColor: Colors.transparent,
+                      tabs: [
+                        const Tab(text: 'Videos'),
+                        Tab(text: tr('Canciones', 'Songs')),
+                        const Tab(text: 'Playlists'),
+                        Tab(text: tr('Carpetas', 'Folders')),
+                        Tab(text: tr('Artistas', 'Artists')),
+                      ],
+                    ),
+                  ),
+                  body: const TabBarView(
                     children: [
-                      const PlayLogo(size: 30),
-                      const SizedBox(width: 10),
-                      const Text('Play Music',
-                          style: TextStyle(fontWeight: FontWeight.bold)),
+                      VideosTab(),
+                      SongsTab(),
+                      PlaylistsTab(),
+                      GroupTab(isFolder: true),
+                      GroupTab(isFolder: false),
                     ],
                   ),
-                  actions: [
-                    IconButton(
-                      icon: const Icon(Icons.search),
-                      tooltip: tr('Buscar', 'Search'),
-                      onPressed: () => Navigator.push(
-                        context,
-                        MaterialPageRoute(builder: (_) => const SearchPage()),
-                      ),
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.settings),
-                      tooltip: tr('Ajustes', 'Settings'),
-                      onPressed: () => Navigator.push(
-                        context,
-                        MaterialPageRoute(builder: (_) => const SettingsPage()),
-                      ),
-                    ),
-                  ],
-                  bottom: TabBar(
-                    isScrollable: true,
-                    tabAlignment: TabAlignment.start,
-                    tabs: [
-                      const Tab(text: 'Videos'),
-                      Tab(text: tr('Canciones', 'Songs')),
-                      const Tab(text: 'Playlists'),
-                      Tab(text: tr('Carpetas', 'Folders')),
-                      Tab(text: tr('Artistas', 'Artists')),
-                    ],
-                  ),
+                  bottomNavigationBar: const MiniPlayer(),
                 ),
-                body: const TabBarView(
-                  children: [
-                    VideosTab(),
-                    SongsTab(),
-                    PlaylistsTab(),
-                    GroupTab(isFolder: true),
-                    GroupTab(isFolder: false),
-                  ],
-                ),
-                bottomNavigationBar: const MiniPlayer(),
               ),
-            ),
-          ],
+            ],
+          ),
         );
       },
     );
@@ -1633,6 +1790,57 @@ class SongsTab extends StatelessWidget {
     return tr('Buenas noches', 'Good evening');
   }
 
+  Widget _notifBanner(BuildContext context) {
+    return Card(
+      margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 12, 8, 4),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.notifications_off_outlined),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    tr('Activa las notificaciones', 'Turn on notifications'),
+                    style: const TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            Text(tr(
+                'Así verás los controles de música en la barra de estado y en la pantalla de bloqueo.',
+                'So you can see the music controls in the status bar and on the lock screen.')),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                TextButton(
+                  onPressed: ctrl.hideNotifBanner,
+                  child: Text(tr('Ahora no', 'Not now')),
+                ),
+                FilledButton(
+                  onPressed: () async {
+                    await ctrl.checkNotifications(ask: true);
+                    if (!ctrl.notifOk) {
+                      try {
+                        await AppSettings.openAppSettings(
+                            type: AppSettingsType.notification);
+                      } catch (_) {}
+                    }
+                  },
+                  child: Text(tr('Activar', 'Enable')),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _header(BuildContext context) {
     final top = ctrl.tracks.where((t) => (ctrl.plays['${t.id}'] ?? 0) > 0).toList()
       ..sort((a, b) =>
@@ -1641,6 +1849,7 @@ class SongsTab extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
+        if (!ctrl.notifOk && !ctrl.notifBannerHidden) _notifBanner(context),
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
           child: Text(_greeting(),
@@ -2172,8 +2381,9 @@ class MiniPlayer extends StatelessWidget {
         final s = ctrl.current;
         if (s == null) return const SizedBox.shrink();
         final cs = Theme.of(context).colorScheme;
-        final tint = (ctrl.dynamicTheme && ctrl.coverColor != null)
-            ? ctrl.coverColor!.withAlpha(70)
+        final g = ctrl.glow;
+        final tint = g != null
+            ? g.withAlpha((ctrl.glowAlpha * 0.4).round())
             : Colors.transparent;
         return Material(
           color: Color.alphaBlend(tint, cs.surfaceContainer),
@@ -2216,7 +2426,7 @@ class MiniPlayer extends StatelessWidget {
 }
 
 // ===========================================================================
-// REPRODUCTOR GRANDE (colores de la carátula, letras, deslizar para cambiar)
+// REPRODUCTOR GRANDE (carrusel de carátulas, colores vivos, letras)
 // ===========================================================================
 class NowPlayingPage extends StatefulWidget {
   const NowPlayingPage({super.key});
@@ -2226,6 +2436,111 @@ class NowPlayingPage extends StatefulWidget {
 
 class _NowPlayingPageState extends State<NowPlayingPage> {
   bool _lyrics = false;
+  final PageController _pc = PageController(viewportFraction: 0.82);
+  bool _programmatic = false;
+  bool _first = true;
+
+  @override
+  void dispose() {
+    _pc.dispose();
+    super.dispose();
+  }
+
+  /// Mueve el carrusel a la canción que suena (si se cambió con los botones,
+  /// la notificación o los auriculares).
+  void _syncTo(int pos) {
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted || !_pc.hasClients || !_pc.position.hasPixels) return;
+      final cur = (_pc.page ?? pos.toDouble()).round();
+      if (cur == pos) {
+        _first = false;
+        return;
+      }
+      _programmatic = true;
+      try {
+        if (_first || (cur - pos).abs() > 3) {
+          _pc.jumpToPage(pos);
+        } else {
+          await _pc.animateToPage(
+            pos,
+            duration: const Duration(milliseconds: 380),
+            curve: Curves.easeOutCubic,
+          );
+        }
+      } catch (_) {
+      } finally {
+        _programmatic = false;
+        _first = false;
+      }
+    });
+  }
+
+  Widget _carousel(Color glow) {
+    final p = ctrl.player;
+    return StreamBuilder<SequenceState?>(
+      stream: p.sequenceStateStream,
+      builder: (context, snap) {
+        final n = ctrl.queue.length;
+        if (n == 0) return const SizedBox.shrink();
+        final st = snap.data;
+        var order = List<int>.generate(n, (i) => i);
+        if (st != null &&
+            st.shuffleModeEnabled &&
+            st.shuffleIndices.length == n) {
+          order = st.shuffleIndices;
+        }
+        final cur = p.currentIndex ?? 0;
+        final pos = max(0, order.indexOf(cur));
+        _syncTo(pos);
+        return LayoutBuilder(
+          builder: (context, box) {
+            final side = max(120.0, min(box.maxWidth * 0.82 - 20, box.maxHeight - 16));
+            return PageView.builder(
+              controller: _pc,
+              itemCount: n,
+              onPageChanged: (i) {
+                if (_programmatic || i >= order.length) return;
+                final qi = order[i];
+                if (qi != p.currentIndex) p.seek(Duration.zero, index: qi);
+              },
+              itemBuilder: (context, i) {
+                final t = ctrl.queue[order[i]];
+                return AnimatedBuilder(
+                  animation: _pc,
+                  builder: (context, child) {
+                    var page = pos.toDouble();
+                    if (_pc.hasClients && _pc.position.hasPixels) {
+                      page = _pc.page ?? page;
+                    }
+                    final d = (page - i).abs().clamp(0.0, 1.0).toDouble();
+                    return Transform.scale(
+                      scale: 1 - 0.16 * d,
+                      child: Opacity(opacity: 1 - 0.5 * d, child: child),
+                    );
+                  },
+                  child: Center(
+                    child: Container(
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(22),
+                        boxShadow: [
+                          BoxShadow(
+                            color: glow.withAlpha(120),
+                            blurRadius: 36,
+                            spreadRadius: 1,
+                          ),
+                        ],
+                      ),
+                      child: TrackArt(track: t, size: side, radius: 22),
+                    ),
+                  ),
+                );
+              },
+            );
+          },
+        );
+      },
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -2235,9 +2550,7 @@ class _NowPlayingPageState extends State<NowPlayingPage> {
       builder: (context, _) {
         final s = ctrl.current;
         final cs = Theme.of(context).colorScheme;
-        final glow = (ctrl.dynamicTheme && ctrl.coverColor != null)
-            ? ctrl.coverColor!
-            : cs.primary;
+        final glow = ctrl.glow ?? cs.primary;
         if (s == null) {
           return Scaffold(
             appBar: AppBar(),
@@ -2245,19 +2558,26 @@ class _NowPlayingPageState extends State<NowPlayingPage> {
                 child: Text(tr('No hay nada sonando', 'Nothing playing'))),
           );
         }
+        final a = ctrl.glowAlpha;
         return AnimatedContainer(
-          duration: const Duration(milliseconds: 600),
+          duration: const Duration(milliseconds: 700),
           decoration: BoxDecoration(
             gradient: LinearGradient(
               begin: Alignment.topCenter,
               end: Alignment.bottomCenter,
-              colors: [glow.withAlpha(150), cs.surface],
+              stops: const [0.0, 0.55, 1.0],
+              colors: [
+                glow.withAlpha(a),
+                glow.withAlpha((a * 0.35).round()),
+                cs.surface,
+              ],
             ),
           ),
           child: Scaffold(
             backgroundColor: Colors.transparent,
             appBar: AppBar(
               backgroundColor: Colors.transparent,
+              surfaceTintColor: Colors.transparent,
               title: Text(tr('Reproduciendo', 'Now playing')),
               actions: [
                 IconButton(
@@ -2277,64 +2597,59 @@ class _NowPlayingPageState extends State<NowPlayingPage> {
               ],
             ),
             body: Padding(
-              padding: const EdgeInsets.all(24),
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
               child: Column(
                 children: [
                   Expanded(
-                    child: _lyrics
-                        ? LyricsView(s)
-                        : GestureDetector(
-                            onHorizontalDragEnd: (d) {
-                              final v = d.primaryVelocity ?? 0;
-                              if (v < -200) p.seekToNext();
-                              if (v > 200) p.seekToPrevious();
-                            },
-                            child: Center(
-                              child: Container(
-                                decoration: BoxDecoration(
-                                  borderRadius: BorderRadius.circular(22),
-                                  boxShadow: [
-                                    BoxShadow(
-                                      color: glow.withAlpha(140),
-                                      blurRadius: 40,
-                                      spreadRadius: 2,
-                                    ),
-                                  ],
-                                ),
-                                child: TrackArt(
-                                    track: s, size: 290, radius: 22),
-                              ),
-                            ),
-                          ),
+                    child: _lyrics ? LyricsView(s) : _carousel(glow),
                   ),
                   const SizedBox(height: 12),
-                  Text(
-                    s.title,
-                    style: Theme.of(context).textTheme.titleLarge,
-                    maxLines: 2,
-                    textAlign: TextAlign.center,
-                    overflow: TextOverflow.ellipsis,
+                  AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 300),
+                    transitionBuilder: (child, anim) => FadeTransition(
+                      opacity: anim,
+                      child: SlideTransition(
+                        position: Tween<Offset>(
+                          begin: const Offset(0.15, 0),
+                          end: Offset.zero,
+                        ).animate(anim),
+                        child: child,
+                      ),
+                    ),
+                    child: Column(
+                      key: ValueKey(s.id),
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          s.title,
+                          style: Theme.of(context).textTheme.titleLarge,
+                          maxLines: 2,
+                          textAlign: TextAlign.center,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        const SizedBox(height: 4),
+                        Text(s.artist),
+                      ],
+                    ),
                   ),
-                  const SizedBox(height: 4),
-                  Text(s.artist),
                   const SizedBox(height: 8),
                   StreamBuilder<Duration>(
                     stream: p.positionStream,
                     builder: (context, snap) {
                       final pos = snap.data ?? Duration.zero;
                       final dur = p.duration ?? Duration.zero;
-                      final max = dur.inMilliseconds > 0
+                      final mx = dur.inMilliseconds > 0
                           ? dur.inMilliseconds.toDouble()
                           : 1.0;
                       final val = pos.inMilliseconds
                           .toDouble()
-                          .clamp(0.0, max)
+                          .clamp(0.0, mx)
                           .toDouble();
                       return Column(
                         children: [
                           Slider(
                             value: val,
-                            max: max,
+                            max: mx,
                             onChanged: (v) =>
                                 p.seek(Duration(milliseconds: v.round())),
                           ),
@@ -3091,9 +3406,7 @@ class _VinylViewState extends State<VinylView>
     final t = ctrl.current;
     if (t == null) return const SizedBox.shrink();
     final p = ctrl.player;
-    final glow = (ctrl.dynamicTheme && ctrl.coverColor != null)
-        ? ctrl.coverColor!
-        : const Color(0xFF7C3AED);
+    final glow = ctrl.glow ?? const Color(0xFF7C3AED);
     return Scaffold(
       backgroundColor: Colors.black,
       body: Container(
@@ -3175,7 +3488,7 @@ class _VinylViewState extends State<VinylView>
 }
 
 // ===========================================================================
-// BUSCADOR + SITIOS + DESCARGA POR URL
+// BUSCADOR Y SITIOS
 // ===========================================================================
 class SearchPage extends StatefulWidget {
   const SearchPage({super.key});
@@ -3194,110 +3507,164 @@ class _SearchPageState extends State<SearchPage> {
     );
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final q = _q.trim().toLowerCase();
-    final results = q.isEmpty
-        ? <Track>[]
-        : ctrl.tracks
-            .where((t) =>
-                t.title.toLowerCase().contains(q) ||
-                t.artist.toLowerCase().contains(q))
-            .toList();
-    final enc = Uri.encodeQueryComponent(_q.trim());
-    return Scaffold(
-      appBar: AppBar(
-        title: TextField(
-          controller: _t,
-          decoration: InputDecoration(
-            hintText: tr('Buscar canciones o sitios', 'Search songs or sites'),
-            border: InputBorder.none,
-          ),
-          onChanged: (v) => setState(() => _q = v),
-        ),
-      ),
-      body: ListView(
-        children: [
-          Card(
-            margin: const EdgeInsets.all(12),
-            color: Theme.of(context).colorScheme.primaryContainer,
-            child: ListTile(
-              leading: const Icon(Icons.download),
-              title: Text(tr('Descargar por URL', 'Download by URL'),
-                  style: const TextStyle(fontWeight: FontWeight.bold)),
-              subtitle: Text(tr('Pega un enlace directo a un archivo de audio',
-                  'Paste a direct link to an audio file')),
-              onTap: () => Navigator.push(
-                context,
-                MaterialPageRoute(builder: (_) => const DownloadPage()),
+  Future<void> _addSite() async {
+    final name = TextEditingController();
+    final url = TextEditingController();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(tr('Agregar sitio', 'Add site')),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: name,
+              decoration: InputDecoration(labelText: tr('Nombre', 'Name')),
+            ),
+            TextField(
+              controller: url,
+              keyboardType: TextInputType.url,
+              decoration: const InputDecoration(
+                labelText: 'URL',
+                hintText: 'https://...',
               ),
             ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text(tr('Cancelar', 'Cancel')),
           ),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            child: Text(tr('Sitios', 'Sites'),
-                style: Theme.of(context).textTheme.titleMedium),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text(tr('Guardar', 'Save')),
           ),
-          Padding(
-            padding: const EdgeInsets.all(12),
-            child: Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: [
-                ActionChip(
-                  avatar: const Icon(Icons.smart_display, size: 18),
-                  label: const Text('YouTube'),
-                  onPressed: () => _openWeb(
-                    'YouTube',
-                    enc.isEmpty
-                        ? 'https://m.youtube.com'
-                        : 'https://m.youtube.com/results?search_query=$enc',
-                  ),
-                ),
-                ActionChip(
-                  avatar: const Icon(Icons.camera_alt, size: 18),
-                  label: const Text('Instagram'),
-                  onPressed: () =>
-                      _openWeb('Instagram', 'https://www.instagram.com'),
-                ),
-                ActionChip(
-                  avatar: const Icon(Icons.facebook, size: 18),
-                  label: const Text('Facebook'),
-                  onPressed: () =>
-                      _openWeb('Facebook', 'https://m.facebook.com'),
-                ),
-                ActionChip(
-                  avatar: const Icon(Icons.cloud, size: 18),
-                  label: const Text('SoundCloud'),
-                  onPressed: () => _openWeb(
-                    'SoundCloud',
-                    enc.isEmpty
-                        ? 'https://m.soundcloud.com'
-                        : 'https://m.soundcloud.com/search?q=$enc',
-                  ),
-                ),
-              ],
-            ),
-          ),
-          if (q.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-              child: Text(tr('En tu música', 'In your music'),
-                  style: Theme.of(context).textTheme.titleMedium),
-            ),
-          for (int i = 0; i < results.length; i++)
-            TrackTile(
-              track: results[i],
-              onTap: () => ctrl.playList(results, i),
-            ),
-          if (q.isNotEmpty && results.isEmpty)
-            Padding(
-              padding: const EdgeInsets.all(16),
-              child: Text(tr('Sin resultados en tu música.',
-                  'No results in your music.')),
-            ),
         ],
       ),
+    );
+    if (ok != true) return;
+    var u = url.text.trim();
+    if (u.isEmpty) return;
+    if (!u.startsWith('http')) u = 'https://$u';
+    final uri = Uri.tryParse(u);
+    if (uri == null || uri.host.isEmpty) {
+      if (mounted) snack(context, tr('Esa dirección no es válida.', 'That address is not valid.'));
+      return;
+    }
+    final n = name.text.trim();
+    ctrl.addSite(n.isEmpty ? uri.host : n, u);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: ctrl,
+      builder: (context, _) {
+        final q = _q.trim().toLowerCase();
+        final results = q.isEmpty
+            ? <Track>[]
+            : ctrl.tracks
+                .where((t) =>
+                    t.title.toLowerCase().contains(q) ||
+                    t.artist.toLowerCase().contains(q))
+                .toList();
+        final enc = Uri.encodeQueryComponent(_q.trim());
+        return Scaffold(
+          appBar: AppBar(
+            title: TextField(
+              controller: _t,
+              decoration: InputDecoration(
+                hintText:
+                    tr('Buscar canciones o sitios', 'Search songs or sites'),
+                border: InputBorder.none,
+              ),
+              onChanged: (v) => setState(() => _q = v),
+            ),
+          ),
+          body: ListView(
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+                child: Text(tr('Sitios', 'Sites'),
+                    style: Theme.of(context).textTheme.titleMedium),
+              ),
+              Padding(
+                padding: const EdgeInsets.all(12),
+                child: Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    ActionChip(
+                      avatar: const Icon(Icons.smart_display, size: 18),
+                      label: const Text('YouTube'),
+                      onPressed: () => _openWeb(
+                        'YouTube',
+                        enc.isEmpty
+                            ? 'https://m.youtube.com'
+                            : 'https://m.youtube.com/results?search_query=$enc',
+                      ),
+                    ),
+                    ActionChip(
+                      avatar: const Icon(Icons.camera_alt, size: 18),
+                      label: const Text('Instagram'),
+                      onPressed: () =>
+                          _openWeb('Instagram', 'https://www.instagram.com'),
+                    ),
+                    ActionChip(
+                      avatar: const Icon(Icons.facebook, size: 18),
+                      label: const Text('Facebook'),
+                      onPressed: () =>
+                          _openWeb('Facebook', 'https://m.facebook.com'),
+                    ),
+                    ActionChip(
+                      avatar: const Icon(Icons.cloud, size: 18),
+                      label: const Text('SoundCloud'),
+                      onPressed: () => _openWeb(
+                        'SoundCloud',
+                        enc.isEmpty
+                            ? 'https://m.soundcloud.com'
+                            : 'https://m.soundcloud.com/search?q=$enc',
+                      ),
+                    ),
+                    for (var i = 0; i < ctrl.sites.length; i++)
+                      InputChip(
+                        avatar: const Icon(Icons.language, size: 18),
+                        label: Text(ctrl.sites[i]['n'] ?? ''),
+                        onPressed: () => _openWeb(
+                            ctrl.sites[i]['n'] ?? '', ctrl.sites[i]['u'] ?? ''),
+                        onDeleted: () => ctrl.removeSite(i),
+                      ),
+                    ActionChip(
+                      avatar: const Icon(Icons.add, size: 18),
+                      label: Text(tr('Agregar sitio', 'Add site')),
+                      onPressed: _addSite,
+                    ),
+                  ],
+                ),
+              ),
+              if (q.isNotEmpty)
+                Padding(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                  child: Text(tr('En tu música', 'In your music'),
+                      style: Theme.of(context).textTheme.titleMedium),
+                ),
+              for (int i = 0; i < results.length; i++)
+                TrackTile(
+                  track: results[i],
+                  onTap: () => ctrl.playList(results, i),
+                ),
+              if (q.isNotEmpty && results.isEmpty)
+                Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Text(tr('Sin resultados en tu música.',
+                      'No results in your music.')),
+                ),
+            ],
+          ),
+        );
+      },
     );
   }
 }
@@ -3311,91 +3678,68 @@ class WebPage extends StatefulWidget {
 }
 
 class _WebPageState extends State<WebPage> {
-  late final WebViewController _c = WebViewController()
-    ..setJavaScriptMode(JavaScriptMode.unrestricted)
-    ..loadRequest(Uri.parse(widget.url));
+  late final WebViewController _c;
+  int _progress = 0;
 
   @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: Text(widget.title)),
-      body: WebViewWidget(controller: _c),
-    );
-  }
-}
-
-class DownloadPage extends StatefulWidget {
-  const DownloadPage({super.key});
-  @override
-  State<DownloadPage> createState() => _DownloadPageState();
-}
-
-class _DownloadPageState extends State<DownloadPage> {
-  final _t = TextEditingController();
-  bool _busy = false;
-  double? _progress;
-  String _msg = '';
-
-  Future<void> _paste() async {
-    final d = await Clipboard.getData('text/plain');
-    if (d?.text != null) setState(() => _t.text = d!.text!.trim());
+  void initState() {
+    super.initState();
+    _c = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setNavigationDelegate(NavigationDelegate(
+        onProgress: (p) {
+          if (mounted) setState(() => _progress = p);
+        },
+      ))
+      ..loadRequest(Uri.parse(widget.url));
   }
 
-  Future<void> _go() async {
-    if (_t.text.trim().isEmpty) return;
-    setState(() {
-      _busy = true;
-      _progress = null;
-      _msg = '';
-    });
-    final r = await ctrl.downloadUrl(_t.text, (p) {
-      if (mounted) setState(() => _progress = p);
-    });
-    if (mounted) {
-      setState(() {
-        _busy = false;
-        _msg = r;
-      });
+  Future<void> _openExternal() async {
+    final u = await _c.currentUrl() ?? widget.url;
+    try {
+      await launchUrl(Uri.parse(u), mode: LaunchMode.externalApplication);
+    } catch (_) {
+      if (mounted) {
+        snack(context, tr('No pude abrir el navegador.', 'Could not open the browser.'));
+      }
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: Text(tr('Descargar por URL', 'Download by URL'))),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Text(tr(
-              'Pega un enlace directo a un archivo de audio (termina en .mp3, .m4a, etc.). Descarga solo música que tengas derecho a guardar.',
-              'Paste a direct link to an audio file (ends in .mp3, .m4a, etc.). Only download music you have the right to keep.',
-            )),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _t,
-              keyboardType: TextInputType.url,
-              decoration: InputDecoration(
-                border: const OutlineInputBorder(),
-                hintText: 'https://...',
-                suffixIcon: IconButton(
-                  icon: const Icon(Icons.paste),
-                  onPressed: _paste,
-                ),
-              ),
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) async {
+        if (didPop) return;
+        if (await _c.canGoBack()) {
+          await _c.goBack();
+        } else if (context.mounted) {
+          Navigator.pop(context);
+        }
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          title: Text(widget.title),
+          actions: [
+            IconButton(
+              icon: const Icon(Icons.refresh),
+              onPressed: () => _c.reload(),
             ),
-            const SizedBox(height: 12),
-            FilledButton.icon(
-              onPressed: _busy ? null : _go,
-              icon: const Icon(Icons.download),
-              label: Text(tr('Descargar', 'Download')),
+            IconButton(
+              icon: const Icon(Icons.open_in_browser),
+              tooltip: tr('Abrir en el navegador', 'Open in browser'),
+              onPressed: _openExternal,
             ),
-            const SizedBox(height: 16),
-            if (_busy) LinearProgressIndicator(value: _progress),
-            if (_msg.isNotEmpty) Text(_msg),
           ],
+          bottom: _progress < 100
+              ? PreferredSize(
+                  preferredSize: const Size.fromHeight(2),
+                  child: LinearProgressIndicator(
+                      value: _progress / 100, minHeight: 2),
+                )
+              : null,
         ),
+        body: WebViewWidget(controller: _c),
       ),
     );
   }
@@ -3503,6 +3847,26 @@ class SettingsPage extends StatelessWidget {
                 value: ctrl.dynamicTheme,
                 onChanged: ctrl.setDynamic,
               ),
+              if (ctrl.dynamicTheme)
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Text(tr('Intensidad del color', 'Color intensity')),
+                          const Spacer(),
+                          Text('${(ctrl.dynIntensity * 100).round()}%'),
+                        ],
+                      ),
+                      Slider(
+                        value: ctrl.dynIntensity,
+                        onChanged: ctrl.setIntensity,
+                      ),
+                    ],
+                  ),
+                ),
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 16),
                 child: SizedBox(
@@ -3547,12 +3911,35 @@ class SettingsPage extends StatelessWidget {
                     'Choose background from gallery')),
                 onTap: ctrl.pickBackground,
               ),
-              if (ctrl.bgPath != null)
+              if (ctrl.bgPath != null) ...[
                 ListTile(
                   leading: const Icon(Icons.hide_image),
                   title: Text(tr('Quitar fondo', 'Remove background')),
                   onTap: ctrl.clearBackground,
                 ),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Text(tr('Oscurecer el fondo', 'Darken background')),
+                          const Spacer(),
+                          Text('${ctrl.bgDim}%'),
+                        ],
+                      ),
+                      Slider(
+                        value: ctrl.bgDim.toDouble(),
+                        min: 0,
+                        max: 85,
+                        divisions: 17,
+                        onChanged: (v) => ctrl.setBgDim(v.round()),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
               _section(context, tr('Biblioteca', 'Library')),
               ListTile(
                 leading: const Icon(Icons.visibility_off),
@@ -3589,7 +3976,7 @@ class SettingsPage extends StatelessWidget {
                     'Si no aparece en la barra, permite las notificaciones aquí',
                     'If it does not show in the bar, allow notifications here')),
                 onTap: () async {
-                  await ctrl.requestNotifications();
+                  await ctrl.checkNotifications(ask: true);
                   try {
                     await AppSettings.openAppSettings(
                         type: AppSettingsType.notification);
