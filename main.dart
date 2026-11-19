@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'dart:ui' as ui;
 
 import 'package:app_settings/app_settings.dart';
 import 'package:flutter/material.dart';
@@ -11,6 +12,7 @@ import 'package:just_audio/just_audio.dart';
 import 'package:just_audio_background/just_audio_background.dart';
 import 'package:on_audio_query_forked/on_audio_query.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart' as ph;
 import 'package:photo_manager/photo_manager.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -21,15 +23,15 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await JustAudioBackground.init(
     androidNotificationChannelId: 'com.mimusica.audio',
-    androidNotificationChannelName: 'Mi Música',
+    androidNotificationChannelName: 'Play Music',
     androidNotificationOngoing: true,
   );
   await ctrl.init();
-  runApp(const MiMusicaApp());
+  runApp(const PlayMusicApp());
 }
 
 // ===========================================================================
-// DATOS
+// DATOS Y UTILIDADES
 // ===========================================================================
 const accents = <Color>[
   Colors.deepPurple,
@@ -40,36 +42,40 @@ const accents = <Color>[
   Colors.green,
 ];
 
-String tr(String es, String en) => ctrl.lang == 'es' ? es : en;
+final messengerKey = GlobalKey<ScaffoldMessengerState>();
 
+String tr(String es, String en) => ctrl.lang == 'es' ? es : en;
 String lastSeg(String path) => path.split(RegExp(r'[\\/]')).last;
 
-String fmt(Duration d) {
-  final m = d.inMinutes;
-  final s = d.inSeconds % 60;
-  return '$m:${s.toString().padLeft(2, '0')}';
-}
+String fmt(Duration d) =>
+    '${d.inMinutes}:${(d.inSeconds % 60).toString().padLeft(2, '0')}';
 
 void snack(BuildContext c, String m) {
-  ScaffoldMessenger.of(c).showSnackBar(SnackBar(content: Text(m)));
+  messengerKey.currentState
+    ?..hideCurrentSnackBar()
+    ..showSnackBar(SnackBar(content: Text(m)));
 }
 
 class Track {
   final int id;
-  final int? msId; // id de la biblioteca de Android (null si es una descarga)
+  final int? msId; // id en la biblioteca de Android (null = descarga propia)
+  final int? albumId;
   final String title;
   final String artist;
   final String path;
   final String uri;
   final int durationMs;
+  final int addedMs;
   const Track({
     required this.id,
     required this.msId,
+    required this.albumId,
     required this.title,
     required this.artist,
     required this.path,
     required this.uri,
     required this.durationMs,
+    required this.addedMs,
   });
   String get folder {
     final i = path.lastIndexOf(RegExp(r'[\\/]'));
@@ -119,13 +125,63 @@ Lyrics? parseLyrics(String raw) {
   return null;
 }
 
+/// Saca el color más llamativo de una carátula (para el tema dinámico).
+Future<Color?> dominantColor(Uint8List bytes) async {
+  try {
+    final codec = await ui.instantiateImageCodec(bytes, targetWidth: 48);
+    final frame = await codec.getNextFrame();
+    final data =
+        await frame.image.toByteData(format: ui.ImageByteFormat.rawRgba);
+    frame.image.dispose();
+    if (data == null) return null;
+    final buckets = <int, List<double>>{};
+    for (var i = 0; i + 3 < data.lengthInBytes; i += 4) {
+      final r = data.getUint8(i);
+      final g = data.getUint8(i + 1);
+      final b = data.getUint8(i + 2);
+      final a = data.getUint8(i + 3);
+      if (a < 200) continue;
+      final mx = max(r, max(g, b));
+      final mn = min(r, min(g, b));
+      final v = mx / 255;
+      final s = mx == 0 ? 0.0 : (mx - mn) / mx;
+      if (v < 0.18 || (v > 0.95 && s < 0.1)) continue;
+      final key = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
+      final e = buckets.putIfAbsent(key, () => [0, 0, 0, 0]);
+      e[0] += 1;
+      e[1] += r;
+      e[2] += g;
+      e[3] += b;
+    }
+    if (buckets.isEmpty) return null;
+    double best = -1;
+    Color? out;
+    for (final e in buckets.values) {
+      final n = e[0];
+      final r = e[1] / n, g = e[2] / n, b = e[3] / n;
+      final mx = max(r, max(g, b));
+      final mn = min(r, min(g, b));
+      final s = mx == 0 ? 0.0 : (mx - mn) / mx;
+      final score = n * (0.25 + s);
+      if (score > best) {
+        best = score;
+        out = Color.fromARGB(255, r.round(), g.round(), b.round());
+      }
+    }
+    return out;
+  } catch (_) {
+    return null;
+  }
+}
+
 // ===========================================================================
 // CEREBRO DE LA APP
 // ===========================================================================
 class Controller extends ChangeNotifier {
   final equalizer = AndroidEqualizer();
+  final loudness = AndroidLoudnessEnhancer();
   late final AudioPlayer player = AudioPlayer(
-    audioPipeline: AudioPipeline(androidAudioEffects: [equalizer]),
+    audioPipeline: AudioPipeline(androidAudioEffects: [equalizer, loudness]),
   );
   final query = OnAudioQuery();
   late SharedPreferences prefs;
@@ -135,21 +191,25 @@ class Controller extends ChangeNotifier {
   List<Track> queue = [];
   Set<int> hidden = {};
   Set<int> deleted = {};
+  Set<int> gone = {};
   Map<String, List<int>> playlists = {};
   Map<String, int> plays = {};
   String? bgPath;
   bool hasPermission = false;
   bool loading = true;
   bool videoActive = false;
+  Color? coverColor;
 
   // Ajustes
   String lang = 'es';
   String themeMode = 'dark';
   int accent = 0;
+  bool dynamicTheme = true;
   bool vinylOnRotate = true;
   bool rememberModes = true;
   int minSeconds = 30;
   double speed = 1.0;
+  String sortMode = 'az';
   DateTime? sleepEnd;
   Timer? _sleep;
 
@@ -164,10 +224,12 @@ class Controller extends ChangeNotifier {
     lang = prefs.getString('lang') ?? 'es';
     themeMode = prefs.getString('theme') ?? 'dark';
     accent = prefs.getInt('accent') ?? 0;
+    dynamicTheme = prefs.getBool('dynamic') ?? true;
     vinylOnRotate = prefs.getBool('vinyl') ?? true;
     rememberModes = prefs.getBool('remember') ?? true;
     minSeconds = prefs.getInt('minSeconds') ?? 30;
     speed = prefs.getDouble('speed') ?? 1.0;
+    sortMode = prefs.getString('sort') ?? 'az';
 
     bgPath = prefs.getString('bg');
     if (bgPath != null && !File(bgPath!).existsSync()) bgPath = null;
@@ -182,12 +244,13 @@ class Controller extends ChangeNotifier {
       final m = jsonDecode(pc) as Map<String, dynamic>;
       plays = m.map((k, v) => MapEntry(k, v as int));
     }
-    hidden = (jsonDecode(prefs.getString('hidden') ?? '[]') as List)
-        .map((e) => e as int)
-        .toSet();
-    deleted = (jsonDecode(prefs.getString('deleted') ?? '[]') as List)
-        .map((e) => e as int)
-        .toSet();
+    Set<int> readSet(String k) =>
+        (jsonDecode(prefs.getString(k) ?? '[]') as List)
+            .map((e) => e as int)
+            .toSet();
+    hidden = readSet('hidden');
+    deleted = readSet('deleted');
+    gone = readSet('gone');
 
     if (rememberModes) {
       final loop = prefs.getInt('loop') ?? 0;
@@ -200,9 +263,69 @@ class Controller extends ChangeNotifier {
         final k = '${queue[i].id}';
         plays[k] = (plays[k] ?? 0) + 1;
         prefs.setString('plays', jsonEncode(plays));
+        _updateCover();
       }
       notifyListeners();
     });
+  }
+
+  // ----- Carátulas (con caché y buena calidad) -----
+  final Map<String, Uint8List> _artCache = {};
+  final Set<String> _artMissing = {};
+
+  Uint8List? artSync(int id, int px) => _artCache['${id}_$px'];
+
+  Future<Uint8List?> art(int id, int px, {int quality = 90}) async {
+    final k = '${id}_$px';
+    final c = _artCache[k];
+    if (c != null) return c;
+    if (_artMissing.contains(k)) return null;
+    try {
+      final b = await query.queryArtwork(
+        id,
+        ArtworkType.AUDIO,
+        format: ArtworkFormat.JPEG,
+        size: px,
+        quality: quality,
+      );
+      if (b == null || b.isEmpty) {
+        _artMissing.add(k);
+        return null;
+      }
+      if (_artCache.length > 120) _artCache.remove(_artCache.keys.first);
+      _artCache[k] = b;
+      return b;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  int _colorFor = -1;
+  Future<void> _updateCover() async {
+    final t = current;
+    if (t == null) return;
+    _colorFor = t.id;
+    if (t.msId == null) {
+      if (coverColor != null) {
+        coverColor = null;
+        notifyListeners();
+      }
+      return;
+    }
+    final b = await art(t.msId!, 250);
+    if (_colorFor != t.id) return;
+    final c = b == null ? null : await dominantColor(b);
+    if (_colorFor != t.id) return;
+    coverColor = c;
+    notifyListeners();
+  }
+
+  // ----- Permisos de notificación (Android 13+) -----
+  Future<void> requestNotifications() async {
+    try {
+      final s = await ph.Permission.notification.status;
+      if (!s.isGranted) await ph.Permission.notification.request();
+    } catch (_) {}
   }
 
   // ----- Biblioteca -----
@@ -213,13 +336,47 @@ class Controller extends ChangeNotifier {
     return d;
   }
 
+  String _k(String s) => s.toLowerCase();
+
   void _refilter() {
-    tracks = all
+    final l = all
         .where((t) =>
             !hidden.contains(t.id) &&
             !deleted.contains(t.id) &&
+            !gone.contains(t.id) &&
             (t.msId == null || t.durationMs >= minSeconds * 1000))
         .toList();
+    int byTitle(Track a, Track b) => _k(a.title).compareTo(_k(b.title));
+    switch (sortMode) {
+      case 'recent':
+        l.sort((a, b) => b.addedMs.compareTo(a.addedMs));
+        break;
+      case 'plays':
+        l.sort((a, b) {
+          final c = (plays['${b.id}'] ?? 0).compareTo(plays['${a.id}'] ?? 0);
+          return c != 0 ? c : byTitle(a, b);
+        });
+        break;
+      case 'artist':
+        l.sort((a, b) {
+          final c = _k(a.artist).compareTo(_k(b.artist));
+          return c != 0 ? c : byTitle(a, b);
+        });
+        break;
+      case 'duration':
+        l.sort((a, b) => b.durationMs.compareTo(a.durationMs));
+        break;
+      default:
+        l.sort(byTitle);
+    }
+    tracks = l;
+  }
+
+  void setSort(String v) {
+    sortMode = v;
+    prefs.setString('sort', v);
+    _refilter();
+    notifyListeners();
   }
 
   Future<void> loadSongs() async {
@@ -241,6 +398,7 @@ class Controller extends ChangeNotifier {
         list.add(Track(
           id: s.id,
           msId: s.id,
+          albumId: s.albumId,
           title: s.title,
           artist: (art == null || art == '<unknown>')
               ? tr('Desconocido', 'Unknown')
@@ -248,6 +406,7 @@ class Controller extends ChangeNotifier {
           path: s.data,
           uri: s.uri!,
           durationMs: s.duration ?? 0,
+          addedMs: (s.dateAdded ?? 0) * 1000,
         ));
       }
     }
@@ -263,11 +422,13 @@ class Controller extends ChangeNotifier {
         list.add(Track(
           id: -((f.path.hashCode.abs() % 1000000000) + 1),
           msId: null,
+          albumId: null,
           title: dot > 0 ? name.substring(0, dot) : name,
           artist: tr('Descargas', 'Downloads'),
           path: f.path,
           uri: Uri.file(f.path).toString(),
           durationMs: 0,
+          addedMs: f.lastModifiedSync().millisecondsSinceEpoch,
         ));
       }
     } catch (_) {}
@@ -284,7 +445,15 @@ class Controller extends ChangeNotifier {
     final sources = queue
         .map((t) => AudioSource.uri(
               Uri.parse(t.uri),
-              tag: MediaItem(id: '${t.id}', title: t.title, artist: t.artist),
+              tag: MediaItem(
+                id: '${t.id}',
+                title: t.title,
+                artist: t.artist,
+                artUri: t.albumId != null
+                    ? Uri.parse(
+                        'content://media/external/audio/albumart/${t.albumId}')
+                    : null,
+              ),
             ))
         .toList();
     try {
@@ -294,6 +463,7 @@ class Controller extends ChangeNotifier {
       );
       await player.setSpeed(speed);
       player.play();
+      _restoreEq();
     } catch (_) {}
   }
 
@@ -365,6 +535,48 @@ class Controller extends ChangeNotifier {
     WidgetsBinding.instance.addPostFrameCallback((_) => notifyListeners());
   }
 
+  // ----- Ecualizador (se guarda y se restaura) -----
+  bool _eqRestored = false;
+  bool eqOn = false;
+
+  Future<void> _restoreEq() async {
+    if (_eqRestored) return;
+    _eqRestored = true;
+    try {
+      final s = prefs.getString('eq');
+      if (s == null) return;
+      final m = jsonDecode(s) as Map<String, dynamic>;
+      final p = await equalizer.parameters;
+      final g = (m['g'] as List).map((e) => (e as num).toDouble()).toList();
+      for (var i = 0; i < min(g.length, p.bands.length); i++) {
+        await p.bands[i].setGain(g[i]);
+      }
+      eqOn = m['on'] == true;
+      await equalizer.setEnabled(eqOn);
+      final lg = (m['lg'] as num?)?.toDouble() ?? 0;
+      await loudness.setTargetGain(lg);
+      await loudness.setEnabled(lg > 0);
+    } catch (_) {}
+  }
+
+  void saveEq(List<double> gains, double loud) {
+    prefs.setString(
+      'eq',
+      jsonEncode({'g': gains, 'on': eqOn, 'lg': loud}),
+    );
+  }
+
+  Future<void> setEqEnabled(bool v) async {
+    eqOn = v;
+    try {
+      await equalizer.setEnabled(v);
+    } catch (_) {}
+    final m = jsonDecode(prefs.getString('eq') ?? '{}') as Map<String, dynamic>;
+    m['on'] = v;
+    prefs.setString('eq', jsonEncode(m));
+    notifyListeners();
+  }
+
   // ----- Ajustes -----
   void setLang(String v) {
     lang = v;
@@ -381,6 +593,12 @@ class Controller extends ChangeNotifier {
   void setAccent(int v) {
     accent = v;
     prefs.setInt('accent', v);
+    notifyListeners();
+  }
+
+  void setDynamic(bool v) {
+    dynamicTheme = v;
+    prefs.setBool('dynamic', v);
     notifyListeners();
   }
 
@@ -407,6 +625,7 @@ class Controller extends ChangeNotifier {
   void _saveSets() {
     prefs.setString('hidden', jsonEncode(hidden.toList()));
     prefs.setString('deleted', jsonEncode(deleted.toList()));
+    prefs.setString('gone', jsonEncode(gone.toList()));
     _refilter();
     notifyListeners();
   }
@@ -431,16 +650,32 @@ class Controller extends ChangeNotifier {
     _saveSets();
   }
 
-  Future<bool> deleteForever(Track t) async {
+  /// Borra el archivo de verdad. Devuelve false si Android no lo permitió.
+  Future<bool> deleteFile(Track t) async {
+    var ok = false;
     try {
-      await File(t.path).delete();
-      deleted.remove(t.id);
-      all.removeWhere((x) => x.id == t.id);
-      _saveSets();
-      return true;
-    } catch (_) {
-      return false;
+      final f = File(t.path);
+      if (await f.exists()) await f.delete();
+      ok = !(await File(t.path).exists());
+    } catch (_) {}
+    if (!ok && t.msId != null) {
+      try {
+        final r = await PhotoManager.editor.deleteWithIds(['${t.msId}']);
+        ok = r.isNotEmpty;
+      } catch (_) {}
     }
+    if (ok) {
+      gone.add(t.id);
+      deleted.remove(t.id);
+      hidden.remove(t.id);
+      all.removeWhere((x) => x.id == t.id);
+      for (final l in playlists.values) {
+        l.remove(t.id);
+      }
+      prefs.setString('playlists', jsonEncode(playlists));
+      _saveSets();
+    }
+    return ok;
   }
 
   // ----- Fondo -----
@@ -529,7 +764,7 @@ class Controller extends ChangeNotifier {
       }
       final u = Uri.https('lrclib.net', '/api/search', params);
       final req = await client.getUrl(u);
-      req.headers.set('User-Agent', 'MiMusica/2.0');
+      req.headers.set('User-Agent', 'PlayMusic/3.0');
       final res = await req.close().timeout(const Duration(seconds: 15));
       if (res.statusCode != 200) return null;
       final body = await res.transform(utf8.decoder).join();
@@ -552,7 +787,8 @@ class Controller extends ChangeNotifier {
   }
 
   // ----- Descarga por URL (solo enlaces directos a archivos de audio) -----
-  Future<String> downloadUrl(String url, void Function(double?) onProgress) async {
+  Future<String> downloadUrl(
+      String url, void Function(double?) onProgress) async {
     final uri = Uri.tryParse(url.trim());
     if (uri == null || !(uri.scheme == 'http' || uri.scheme == 'https')) {
       return tr('Ese enlace no es válido.', 'That link is not valid.');
@@ -622,22 +858,27 @@ final ctrl = Controller();
 // ===========================================================================
 // APP Y PANTALLA PRINCIPAL
 // ===========================================================================
-class MiMusicaApp extends StatelessWidget {
-  const MiMusicaApp({super.key});
+class PlayMusicApp extends StatelessWidget {
+  const PlayMusicApp({super.key});
 
-  ThemeData _theme(Brightness b) => ThemeData(
-        useMaterial3: true,
-        colorScheme:
-            ColorScheme.fromSeed(seedColor: accents[ctrl.accent], brightness: b),
-      );
+  ThemeData _theme(Brightness b) {
+    final seed = (ctrl.dynamicTheme && ctrl.coverColor != null)
+        ? ctrl.coverColor!
+        : accents[ctrl.accent];
+    return ThemeData(
+      useMaterial3: true,
+      colorScheme: ColorScheme.fromSeed(seedColor: seed, brightness: b),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     return ListenableBuilder(
       listenable: ctrl,
       builder: (context, _) => MaterialApp(
-        title: 'Mi Música',
+        title: 'Play Music',
         debugShowCheckedModeBanner: false,
+        scaffoldMessengerKey: messengerKey,
         theme: _theme(Brightness.light),
         darkTheme: _theme(Brightness.dark),
         themeMode: ctrl.themeMode == 'light'
@@ -675,7 +916,7 @@ class _RootState extends State<Root> {
   @override
   void initState() {
     super.initState();
-    ctrl.loadSongs();
+    ctrl.loadSongs().then((_) => ctrl.requestNotifications());
   }
 
   @override
@@ -683,13 +924,31 @@ class _RootState extends State<Root> {
     return ListenableBuilder(
       listenable: ctrl,
       builder: (context, _) {
-        final surface = Theme.of(context).colorScheme.surface;
+        if (ctrl.loading && ctrl.all.isEmpty) return const SplashScreen();
+        final cs = Theme.of(context).colorScheme;
         return Stack(
           fit: StackFit.expand,
           children: [
             if (ctrl.bgPath != null)
               Image.file(File(ctrl.bgPath!), fit: BoxFit.cover),
-            Container(color: surface.withAlpha(ctrl.bgPath != null ? 150 : 255)),
+            if (ctrl.bgPath != null)
+              Container(color: cs.surface.withAlpha(150))
+            else
+              AnimatedContainer(
+                duration: const Duration(milliseconds: 600),
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [
+                      (ctrl.dynamicTheme && ctrl.coverColor != null)
+                          ? ctrl.coverColor!.withAlpha(90)
+                          : cs.primary.withAlpha(40),
+                      cs.surface,
+                    ],
+                  ),
+                ),
+              ),
             DefaultTabController(
               length: 5,
               initialIndex: 1,
@@ -697,7 +956,14 @@ class _RootState extends State<Root> {
                 backgroundColor: Colors.transparent,
                 appBar: AppBar(
                   backgroundColor: Colors.transparent,
-                  title: const Text('Mi Música'),
+                  title: Row(
+                    children: [
+                      const PlayLogo(size: 30),
+                      const SizedBox(width: 10),
+                      const Text('Play Music',
+                          style: TextStyle(fontWeight: FontWeight.bold)),
+                    ],
+                  ),
                   actions: [
                     IconButton(
                       icon: const Icon(Icons.search),
@@ -728,11 +994,11 @@ class _RootState extends State<Root> {
                     ],
                   ),
                 ),
-                body: TabBarView(
+                body: const TabBarView(
                   children: [
-                    const VideosTab(),
-                    const SongsTab(),
-                    const PlaylistsTab(),
+                    VideosTab(),
+                    SongsTab(),
+                    PlaylistsTab(),
                     GroupTab(isFolder: true),
                     GroupTab(isFolder: false),
                   ],
@@ -748,7 +1014,216 @@ class _RootState extends State<Root> {
 }
 
 // ===========================================================================
-// PIEZAS REUTILIZABLES
+// LOGO, BARRAS ANIMADAS Y PANTALLA DE CARGA
+// ===========================================================================
+class _LogoPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final s = size.width;
+    final rect = Rect.fromLTWH(0, 0, s, s);
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(rect, Radius.circular(s * 0.22)),
+      Paint()
+        ..shader = const LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [Color(0xFF7C3AED), Color(0xFFEC4899)],
+        ).createShader(rect),
+    );
+    final c = Offset(s * 0.5, s * 0.45);
+    final r = s * 0.30;
+    canvas.drawCircle(c, r, Paint()..color = const Color(0xFF111118));
+    final ring = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = max(1.0, s * 0.004)
+      ..color = const Color(0xFF343442);
+    for (final k in [0.88, 0.76, 0.64]) {
+      canvas.drawCircle(c, r * k, ring);
+    }
+    final lr = r * 0.52;
+    final lrect = Rect.fromCircle(center: c, radius: lr);
+    canvas.drawCircle(
+      c,
+      lr,
+      Paint()
+        ..shader = const LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [Color(0xFFFBBF24), Color(0xFFF97316)],
+        ).createShader(lrect),
+    );
+    final t = lr * 0.62;
+    final tri = Path()
+      ..moveTo(c.dx - t * 0.55, c.dy - t)
+      ..lineTo(c.dx - t * 0.55, c.dy + t)
+      ..lineTo(c.dx + t * 0.95, c.dy)
+      ..close();
+    canvas.drawPath(tri, Paint()..color = Colors.white);
+    const heights = [0.05, 0.09, 0.14, 0.085, 0.05];
+    final bw = s * 0.055;
+    final gap = s * 0.095;
+    final base = s * 0.925;
+    for (var i = 0; i < heights.length; i++) {
+      final x = s * 0.5 - gap * 2 + gap * i;
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromLTRB(x - bw / 2, base - s * heights[i], x + bw / 2, base),
+          Radius.circular(bw / 2),
+        ),
+        Paint()..color = Colors.white.withAlpha(235),
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
+class PlayLogo extends StatelessWidget {
+  final double size;
+  const PlayLogo({super.key, required this.size});
+  @override
+  Widget build(BuildContext context) =>
+      CustomPaint(size: Size(size, size), painter: _LogoPainter());
+}
+
+class MusicBars extends StatefulWidget {
+  final int count;
+  final double width;
+  final double height;
+  final Color? color;
+  final bool animate;
+  const MusicBars({
+    super.key,
+    this.count = 5,
+    this.width = 40,
+    this.height = 40,
+    this.color,
+    this.animate = true,
+  });
+  @override
+  State<MusicBars> createState() => _MusicBarsState();
+}
+
+class _MusicBarsState extends State<MusicBars>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c = AnimationController(
+      vsync: this, duration: const Duration(milliseconds: 1400))
+    ..repeat();
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final color = widget.color ?? Theme.of(context).colorScheme.primary;
+    final barW = widget.width / (widget.count * 1.6);
+    return AnimatedBuilder(
+      animation: _c,
+      builder: (context, _) => SizedBox(
+        width: widget.width,
+        height: widget.height,
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          crossAxisAlignment: CrossAxisAlignment.end,
+          children: [
+            for (int i = 0; i < widget.count; i++)
+              Container(
+                width: barW,
+                height: widget.animate
+                    ? widget.height *
+                        (0.2 +
+                            0.8 *
+                                (0.5 +
+                                    0.5 *
+                                        sin(2 * pi * _c.value * (1 + i % 3) +
+                                            i * 1.3)))
+                    : widget.height * 0.2,
+                decoration: BoxDecoration(
+                  color: color,
+                  borderRadius: BorderRadius.circular(barW / 2),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class MusicLoader extends StatelessWidget {
+  final String? text;
+  const MusicLoader({super.key, this.text});
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const MusicBars(count: 7, width: 90, height: 56),
+          const SizedBox(height: 16),
+          Text(text ?? tr('Cargando tu música...', 'Loading your music...')),
+        ],
+      ),
+    );
+  }
+}
+
+class SplashScreen extends StatelessWidget {
+  const SplashScreen({super.key});
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [Color(0xFF1E0A46), Color(0xFF7A1B5E)],
+          ),
+        ),
+        child: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TweenAnimationBuilder<double>(
+                tween: Tween(begin: 0.6, end: 1.0),
+                duration: const Duration(milliseconds: 900),
+                curve: Curves.elasticOut,
+                builder: (context, v, child) =>
+                    Transform.scale(scale: v, child: child),
+                child: const PlayLogo(size: 130),
+              ),
+              const SizedBox(height: 20),
+              const Text(
+                'Play Music',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 30,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const SizedBox(height: 28),
+              const MusicBars(
+                  count: 9, width: 110, height: 52, color: Color(0xFFFBBF24)),
+              const SizedBox(height: 14),
+              Text(
+                tr('Cargando tu música...', 'Loading your music...'),
+                style: const TextStyle(color: Colors.white70),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ===========================================================================
+// CARÁTULAS NÍTIDAS
 // ===========================================================================
 class TrackArt extends StatelessWidget {
   final Track track;
@@ -761,28 +1236,46 @@ class TrackArt extends StatelessWidget {
     this.radius = 8,
   });
 
-  Widget get _placeholder => Container(
+  Widget _ph(BuildContext context) => Container(
         width: size,
         height: size,
         decoration: BoxDecoration(
-          color: Colors.white12,
           borderRadius: BorderRadius.circular(radius),
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [
+              Theme.of(context).colorScheme.primaryContainer,
+              Theme.of(context).colorScheme.secondaryContainer,
+            ],
+          ),
         ),
         child: Icon(Icons.music_note, size: size * 0.5),
       );
 
   @override
   Widget build(BuildContext context) {
-    if (track.msId == null) return _placeholder;
-    return QueryArtworkWidget(
-      id: track.msId!,
-      type: ArtworkType.AUDIO,
-      size: size > 100 ? 600 : 200,
-      artworkWidth: size,
-      artworkHeight: size,
-      artworkFit: BoxFit.cover,
-      artworkBorder: BorderRadius.circular(radius),
-      nullArtworkWidget: _placeholder,
+    if (track.msId == null) return _ph(context);
+    final dpr = MediaQuery.of(context).devicePixelRatio;
+    final px = size > 100 ? 1000 : 300;
+    Widget img(Uint8List b) => ClipRRect(
+          borderRadius: BorderRadius.circular(radius),
+          child: Image.memory(
+            b,
+            width: size,
+            height: size,
+            fit: BoxFit.cover,
+            cacheWidth: (size * dpr).round(),
+            filterQuality: FilterQuality.high,
+            isAntiAlias: true,
+            gaplessPlayback: true,
+          ),
+        );
+    final cached = ctrl.artSync(track.msId!, px);
+    if (cached != null) return img(cached);
+    return FutureBuilder<Uint8List?>(
+      future: ctrl.art(track.msId!, px, quality: size > 100 ? 100 : 92),
+      builder: (context, s) => s.data != null ? img(s.data!) : _ph(context),
     );
   }
 }
@@ -807,6 +1300,9 @@ class PlayPauseButton extends StatelessWidget {
   }
 }
 
+// ===========================================================================
+// DIÁLOGOS Y MENÚ DE TRES PUNTOS
+// ===========================================================================
 Future<String?> askName(BuildContext context) {
   final t = TextEditingController();
   return showDialog<String>(
@@ -937,10 +1433,8 @@ Future<void> handleTrackAction(
       try {
         await Share.shareXFiles([XFile(t.path)], text: t.title);
       } catch (_) {
-        if (context.mounted) {
-          snack(context, tr('No pude compartir este archivo.',
-              'Could not share this file.'));
-        }
+        snack(context, tr('No pude compartir este archivo.',
+            'Could not share this file.'));
       }
       break;
     case 'viz':
@@ -974,26 +1468,47 @@ Future<void> handleTrackAction(
           'Song hidden. You can show it again in Settings.'));
       break;
     case 'delete':
-      final ok = await showDialog<bool>(
+      final r = await showDialog<String>(
         context: context,
         builder: (ctx) => AlertDialog(
           title: Text(tr('¿Borrar esta canción?', 'Delete this song?')),
           content: Text(tr(
-              'Irá a "Eliminados recientemente" y podrás recuperarla.',
-              'It will go to "Recently deleted" and you can restore it.')),
+              'Puedes borrar el archivo del teléfono o solo enviarla a "Eliminados recientemente" (se puede recuperar).',
+              'You can delete the file from the phone or just send it to "Recently deleted" (can be restored).')),
           actions: [
             TextButton(
-              onPressed: () => Navigator.pop(ctx, false),
+              onPressed: () => Navigator.pop(ctx, 'no'),
               child: Text(tr('Cancelar', 'Cancel')),
             ),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, 'trash'),
+              child: Text(tr('A eliminados', 'To deleted')),
+            ),
             FilledButton(
-              onPressed: () => Navigator.pop(ctx, true),
-              child: Text(tr('Borrar', 'Delete')),
+              onPressed: () => Navigator.pop(ctx, 'file'),
+              child: Text(tr('Borrar archivo', 'Delete file')),
             ),
           ],
         ),
       );
-      if (ok == true) ctrl.softDelete(t);
+      if (r == 'trash') {
+        ctrl.softDelete(t);
+        snack(context, tr('Enviada a Eliminados recientemente.',
+            'Sent to Recently deleted.'));
+      } else if (r == 'file') {
+        final ok = await ctrl.deleteFile(t);
+        if (ok) {
+          snack(context, tr('Canción borrada del teléfono.',
+              'Song deleted from the phone.'));
+        } else {
+          ctrl.softDelete(t);
+          snack(
+            context,
+            tr('Android no permitió borrar el archivo. La envié a Eliminados recientemente.',
+                'Android did not allow deleting the file. Sent to Recently deleted.'),
+          );
+        }
+      }
       break;
   }
 }
@@ -1032,6 +1547,9 @@ Widget trackMenu(BuildContext context, Track t) {
   );
 }
 
+// ===========================================================================
+// FILA DE CANCIÓN (resalta la que está sonando)
+// ===========================================================================
 class TrackTile extends StatelessWidget {
   final Track track;
   final VoidCallback onTap;
@@ -1045,10 +1563,46 @@ class TrackTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final playing = ctrl.current?.id == track.id;
     return ListTile(
       onTap: onTap,
-      leading: TrackArt(track: track, size: 50),
-      title: Text(track.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+      selected: playing,
+      selectedColor: cs.primary,
+      selectedTileColor: cs.primary.withAlpha(36),
+      shape: playing
+          ? Border(left: BorderSide(color: cs.primary, width: 4))
+          : null,
+      leading: Stack(
+        alignment: Alignment.center,
+        children: [
+          TrackArt(track: track, size: 50),
+          if (playing)
+            Container(
+              width: 50,
+              height: 50,
+              decoration: BoxDecoration(
+                color: Colors.black54,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Center(
+                child: MusicBars(
+                  count: 3,
+                  width: 20,
+                  height: 18,
+                  color: Colors.white,
+                  animate: ctrl.player.playing,
+                ),
+              ),
+            ),
+        ],
+      ),
+      title: Text(
+        track.title,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: TextStyle(fontWeight: playing ? FontWeight.bold : null),
+      ),
       subtitle:
           Text(track.artist, maxLines: 1, overflow: TextOverflow.ellipsis),
       trailing: trailing ?? trackMenu(context, track),
@@ -1057,71 +1611,167 @@ class TrackTile extends StatelessWidget {
 }
 
 // ===========================================================================
-// PESTAÑA: CANCIONES
+// PESTAÑA: CANCIONES (con "Ordenar por" y más escuchadas)
 // ===========================================================================
+const _sortLabels = <String, List<String>>{
+  'recent': ['Más recientes', 'Most recent'],
+  'plays': ['Más reproducido', 'Most played'],
+  'az': ['A a Z', 'A to Z'],
+  'artist': ['Artista', 'Artist'],
+  'duration': ['Duración más larga', 'Longest duration'],
+};
+
+String sortLabel(String k) => tr(_sortLabels[k]![0], _sortLabels[k]![1]);
+
 class SongsTab extends StatelessWidget {
   const SongsTab({super.key});
 
-  @override
-  Widget build(BuildContext context) {
-    if (ctrl.loading && ctrl.all.isEmpty) {
-      return const Center(child: CircularProgressIndicator());
-    }
-    if (!ctrl.hasPermission) {
-      return Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(tr('Necesito permiso para ver tu música',
-                'I need permission to see your music')),
-            const SizedBox(height: 12),
-            FilledButton(
-              onPressed: ctrl.loadSongs,
-              child: Text(tr('Dar permiso', 'Grant permission')),
-            ),
-          ],
+  String _greeting() {
+    final h = DateTime.now().hour;
+    if (h < 12) return tr('Buenos días', 'Good morning');
+    if (h < 19) return tr('Buenas tardes', 'Good afternoon');
+    return tr('Buenas noches', 'Good evening');
+  }
+
+  Widget _header(BuildContext context) {
+    final top = ctrl.tracks.where((t) => (ctrl.plays['${t.id}'] ?? 0) > 0).toList()
+      ..sort((a, b) =>
+          (ctrl.plays['${b.id}'] ?? 0).compareTo(ctrl.plays['${a.id}'] ?? 0));
+    final favs = top.take(8).toList();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+          child: Text(_greeting(),
+              style: Theme.of(context).textTheme.headlineSmall),
         ),
-      );
-    }
-    if (ctrl.tracks.isEmpty) {
-      return Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Text(
-            tr('No encontré canciones. Descarga música y desliza hacia abajo para actualizar.',
-                'No songs found. Download music and pull down to refresh.'),
-            textAlign: TextAlign.center,
+        if (favs.length >= 3) ...[
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 6),
+            child: Text(tr('Tus más escuchadas', 'Your most played'),
+                style: Theme.of(context).textTheme.titleSmall),
+          ),
+          SizedBox(
+            height: 140,
+            child: ListView.separated(
+              scrollDirection: Axis.horizontal,
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              itemCount: favs.length,
+              separatorBuilder: (_, __) => const SizedBox(width: 12),
+              itemBuilder: (context, i) => GestureDetector(
+                onTap: () => ctrl.playList(favs, i),
+                child: SizedBox(
+                  width: 104,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      TrackArt(track: favs[i], size: 104, radius: 14),
+                      const SizedBox(height: 4),
+                      Text(favs[i].title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontSize: 12)),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+          child: Row(
+            children: [
+              FilledButton.tonalIcon(
+                onPressed: ctrl.playAllShuffled,
+                icon: const Icon(Icons.shuffle),
+                label: Text(tr('Aleatorio', 'Shuffle')),
+              ),
+              const Spacer(),
+              PopupMenuButton<String>(
+                onSelected: ctrl.setSort,
+                itemBuilder: (_) => [
+                  for (final k in _sortLabels.keys)
+                    CheckedPopupMenuItem<String>(
+                      value: k,
+                      checked: ctrl.sortMode == k,
+                      child: Text(sortLabel(k)),
+                    ),
+                ],
+                child: Padding(
+                  padding: const EdgeInsets.all(8),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.sort),
+                      const SizedBox(width: 6),
+                      Text(sortLabel(ctrl.sortMode)),
+                    ],
+                  ),
+                ),
+              ),
+            ],
           ),
         ),
-      );
-    }
-    return RefreshIndicator(
-      onRefresh: ctrl.loadSongs,
-      child: ListView.builder(
-        physics: const AlwaysScrollableScrollPhysics(),
-        itemCount: ctrl.tracks.length + 1,
-        itemBuilder: (context, i) {
-          if (i == 0) {
-            return ListTile(
-              leading: const Icon(Icons.shuffle),
-              title: Text(tr('Reproducir todo en aleatorio',
-                  'Shuffle play everything')),
-              onTap: ctrl.playAllShuffled,
-            );
-          }
-          final t = ctrl.tracks[i - 1];
-          return TrackTile(
-            track: t,
-            onTap: () => ctrl.playList(ctrl.tracks, i - 1),
+      ],
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: ctrl,
+      builder: (context, _) {
+        if (ctrl.loading && ctrl.all.isEmpty) return const MusicLoader();
+        if (!ctrl.hasPermission) {
+          return Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(tr('Necesito permiso para ver tu música',
+                    'I need permission to see your music')),
+                const SizedBox(height: 12),
+                FilledButton(
+                  onPressed: ctrl.loadSongs,
+                  child: Text(tr('Dar permiso', 'Grant permission')),
+                ),
+              ],
+            ),
           );
-        },
-      ),
+        }
+        if (ctrl.tracks.isEmpty) {
+          return Center(
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: Text(
+                tr('No encontré canciones. Descarga música y desliza hacia abajo para actualizar.',
+                    'No songs found. Download music and pull down to refresh.'),
+                textAlign: TextAlign.center,
+              ),
+            ),
+          );
+        }
+        return RefreshIndicator(
+          onRefresh: ctrl.loadSongs,
+          child: ListView.builder(
+            physics: const AlwaysScrollableScrollPhysics(),
+            itemCount: ctrl.tracks.length + 1,
+            itemBuilder: (context, i) {
+              if (i == 0) return _header(context);
+              return TrackTile(
+                track: ctrl.tracks[i - 1],
+                onTap: () => ctrl.playList(ctrl.tracks, i - 1),
+              );
+            },
+          ),
+        );
+      },
     );
   }
 }
 
 // ===========================================================================
-// PESTAÑAS: CARPETAS Y ARTISTAS
+// PESTAÑAS: CARPETAS Y ARTISTAS (con miniaturas)
 // ===========================================================================
 class GroupTab extends StatelessWidget {
   final bool isFolder;
@@ -1129,32 +1779,39 @@ class GroupTab extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final groups = <String, List<Track>>{};
-    for (final t in ctrl.tracks) {
-      groups.putIfAbsent(isFolder ? t.folder : t.artist, () => []).add(t);
-    }
-    final keys = groups.keys.toList()
-      ..sort((a, b) => (isFolder ? lastSeg(a) : a)
-          .toLowerCase()
-          .compareTo((isFolder ? lastSeg(b) : b).toLowerCase()));
-    if (keys.isEmpty) {
-      return Center(child: Text(tr('Sin canciones', 'No songs')));
-    }
-    return ListView.builder(
-      itemCount: keys.length,
-      itemBuilder: (context, i) {
-        final k = keys[i];
-        final name = isFolder ? lastSeg(k) : k;
-        return ListTile(
-          leading: Icon(isFolder ? Icons.folder : Icons.person),
-          title: Text(name, maxLines: 1, overflow: TextOverflow.ellipsis),
-          subtitle: Text('${groups[k]!.length} ${tr('canciones', 'songs')}'),
-          onTap: () => Navigator.push(
-            context,
-            MaterialPageRoute(
-              builder: (_) => TrackListPage(name, groups[k]!),
-            ),
-          ),
+    return ListenableBuilder(
+      listenable: ctrl,
+      builder: (context, _) {
+        final groups = <String, List<Track>>{};
+        for (final t in ctrl.tracks) {
+          groups.putIfAbsent(isFolder ? t.folder : t.artist, () => []).add(t);
+        }
+        final keys = groups.keys.toList()
+          ..sort((a, b) => (isFolder ? lastSeg(a) : a)
+              .toLowerCase()
+              .compareTo((isFolder ? lastSeg(b) : b).toLowerCase()));
+        if (keys.isEmpty) {
+          return Center(child: Text(tr('Sin canciones', 'No songs')));
+        }
+        return ListView.builder(
+          itemCount: keys.length,
+          itemBuilder: (context, i) {
+            final k = keys[i];
+            final list = groups[k]!;
+            final name = isFolder ? lastSeg(k) : k;
+            final withArt = list.firstWhere((t) => t.msId != null,
+                orElse: () => list.first);
+            return ListTile(
+              leading: TrackArt(
+                  track: withArt, size: 50, radius: isFolder ? 8 : 25),
+              title: Text(name, maxLines: 1, overflow: TextOverflow.ellipsis),
+              subtitle: Text('${list.length} ${tr('canciones', 'songs')}'),
+              onTap: () => Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => TrackListPage(name, list)),
+              ),
+            );
+          },
         );
       },
     );
@@ -1204,40 +1861,45 @@ class PlaylistsTab extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final names = ctrl.playlists.keys.toList();
-    return Column(
-      children: [
-        ListTile(
-          leading: const Icon(Icons.add),
-          title: Text(tr('Nueva lista', 'New playlist')),
-          onTap: () async {
-            final name = await askName(context);
-            if (name != null && name.isNotEmpty) ctrl.createPlaylist(name);
-          },
-        ),
-        Expanded(
-          child: ListView.builder(
-            itemCount: names.length,
-            itemBuilder: (context, i) {
-              final n = names[i];
-              return ListTile(
-                leading: const Icon(Icons.queue_music),
-                title: Text(n),
-                subtitle:
-                    Text('${ctrl.playlists[n]!.length} ${tr('canciones', 'songs')}'),
-                trailing: IconButton(
-                  icon: const Icon(Icons.delete_outline),
-                  onPressed: () => ctrl.deletePlaylist(n),
-                ),
-                onTap: () => Navigator.push(
-                  context,
-                  MaterialPageRoute(builder: (_) => PlaylistPage(n)),
-                ),
-              );
-            },
-          ),
-        ),
-      ],
+    return ListenableBuilder(
+      listenable: ctrl,
+      builder: (context, _) {
+        final names = ctrl.playlists.keys.toList();
+        return Column(
+          children: [
+            ListTile(
+              leading: const Icon(Icons.add),
+              title: Text(tr('Nueva lista', 'New playlist')),
+              onTap: () async {
+                final name = await askName(context);
+                if (name != null && name.isNotEmpty) ctrl.createPlaylist(name);
+              },
+            ),
+            Expanded(
+              child: ListView.builder(
+                itemCount: names.length,
+                itemBuilder: (context, i) {
+                  final n = names[i];
+                  return ListTile(
+                    leading: const Icon(Icons.queue_music),
+                    title: Text(n),
+                    subtitle: Text(
+                        '${ctrl.playlists[n]!.length} ${tr('canciones', 'songs')}'),
+                    trailing: IconButton(
+                      icon: const Icon(Icons.delete_outline),
+                      onPressed: () => ctrl.deletePlaylist(n),
+                    ),
+                    onTap: () => Navigator.push(
+                      context,
+                      MaterialPageRoute(builder: (_) => PlaylistPage(n)),
+                    ),
+                  );
+                },
+              ),
+            ),
+          ],
+        );
+      },
     );
   }
 }
@@ -1358,9 +2020,7 @@ class _VideosTabState extends State<VideosTab>
         ),
       );
     }
-    if (_items == null) {
-      return const Center(child: CircularProgressIndicator());
-    }
+    if (_items == null) return const MusicLoader();
     if (_items!.isEmpty) {
       return Center(child: Text(tr('No encontré videos', 'No videos found')));
     }
@@ -1386,10 +2046,12 @@ class _VideosTabState extends State<VideosTab>
               fit: StackFit.expand,
               children: [
                 FutureBuilder<Uint8List?>(
-                  future: a.thumbnailDataWithSize(const ThumbnailSize(300, 300)),
+                  future: a.thumbnailDataWithSize(const ThumbnailSize(400, 400)),
                   builder: (context, s) => s.data == null
                       ? Container(color: Colors.white12)
-                      : Image.memory(s.data!, fit: BoxFit.cover),
+                      : Image.memory(s.data!,
+                          fit: BoxFit.cover,
+                          filterQuality: FilterQuality.high),
                 ),
                 Positioned(
                   right: 6,
@@ -1470,7 +2132,7 @@ class _VideoPageState extends State<VideoPage> {
       body: _err != null
           ? Center(child: Text(_err!))
           : c == null
-              ? const Center(child: CircularProgressIndicator())
+              ? const MusicLoader()
               : Column(
                   children: [
                     Expanded(
@@ -1497,7 +2159,7 @@ class _VideoPageState extends State<VideoPage> {
 }
 
 // ===========================================================================
-// MINI REPRODUCTOR
+// MINI REPRODUCTOR (con color de la carátula y barra de progreso)
 // ===========================================================================
 class MiniPlayer extends StatelessWidget {
   const MiniPlayer({super.key});
@@ -1509,21 +2171,42 @@ class MiniPlayer extends StatelessWidget {
       builder: (context, snap) {
         final s = ctrl.current;
         if (s == null) return const SizedBox.shrink();
+        final cs = Theme.of(context).colorScheme;
+        final tint = (ctrl.dynamicTheme && ctrl.coverColor != null)
+            ? ctrl.coverColor!.withAlpha(70)
+            : Colors.transparent;
         return Material(
-          color: Theme.of(context).colorScheme.surfaceContainer,
+          color: Color.alphaBlend(tint, cs.surfaceContainer),
           child: SafeArea(
             top: false,
-            child: ListTile(
-              onTap: () => Navigator.push(
-                context,
-                MaterialPageRoute(builder: (_) => const NowPlayingPage()),
-              ),
-              leading: TrackArt(track: s, size: 44),
-              title:
-                  Text(s.title, maxLines: 1, overflow: TextOverflow.ellipsis),
-              subtitle:
-                  Text(s.artist, maxLines: 1, overflow: TextOverflow.ellipsis),
-              trailing: const PlayPauseButton(),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                StreamBuilder<Duration>(
+                  stream: ctrl.player.positionStream,
+                  builder: (context, ps) {
+                    final dur = ctrl.player.duration?.inMilliseconds ?? 0;
+                    final pos = ps.data?.inMilliseconds ?? 0;
+                    return LinearProgressIndicator(
+                      minHeight: 2,
+                      value: dur > 0 ? (pos / dur).clamp(0.0, 1.0) : 0,
+                      backgroundColor: Colors.transparent,
+                    );
+                  },
+                ),
+                ListTile(
+                  onTap: () => Navigator.push(
+                    context,
+                    MaterialPageRoute(builder: (_) => const NowPlayingPage()),
+                  ),
+                  leading: TrackArt(track: s, size: 44),
+                  title: Text(s.title,
+                      maxLines: 1, overflow: TextOverflow.ellipsis),
+                  subtitle: Text(s.artist,
+                      maxLines: 1, overflow: TextOverflow.ellipsis),
+                  trailing: const PlayPauseButton(),
+                ),
+              ],
             ),
           ),
         );
@@ -1533,7 +2216,7 @@ class MiniPlayer extends StatelessWidget {
 }
 
 // ===========================================================================
-// REPRODUCTOR GRANDE (con letras)
+// REPRODUCTOR GRANDE (colores de la carátula, letras, deslizar para cambiar)
 // ===========================================================================
 class NowPlayingPage extends StatefulWidget {
   const NowPlayingPage({super.key});
@@ -1547,131 +2230,168 @@ class _NowPlayingPageState extends State<NowPlayingPage> {
   @override
   Widget build(BuildContext context) {
     final p = ctrl.player;
-    return StreamBuilder<int?>(
-      stream: p.currentIndexStream,
-      builder: (context, snap) {
+    return ListenableBuilder(
+      listenable: ctrl,
+      builder: (context, _) {
         final s = ctrl.current;
+        final cs = Theme.of(context).colorScheme;
+        final glow = (ctrl.dynamicTheme && ctrl.coverColor != null)
+            ? ctrl.coverColor!
+            : cs.primary;
         if (s == null) {
           return Scaffold(
             appBar: AppBar(),
-            body: Center(child: Text(tr('No hay nada sonando', 'Nothing playing'))),
+            body: Center(
+                child: Text(tr('No hay nada sonando', 'Nothing playing'))),
           );
         }
-        return Scaffold(
-          appBar: AppBar(
-            title: Text(tr('Reproduciendo', 'Now playing')),
-            actions: [
-              IconButton(
-                icon: Icon(_lyrics ? Icons.album : Icons.lyrics_outlined),
-                tooltip: tr('Letra', 'Lyrics'),
-                onPressed: () => setState(() => _lyrics = !_lyrics),
-              ),
-              IconButton(
-                icon: const Icon(Icons.equalizer),
-                tooltip: tr('Ecualizador', 'Equalizer'),
-                onPressed: () => Navigator.push(
-                  context,
-                  MaterialPageRoute(builder: (_) => const EqualizerPage()),
-                ),
-              ),
-              trackMenu(context, s),
-            ],
+        return AnimatedContainer(
+          duration: const Duration(milliseconds: 600),
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+              colors: [glow.withAlpha(150), cs.surface],
+            ),
           ),
-          body: Padding(
-            padding: const EdgeInsets.all(24),
-            child: Column(
-              children: [
-                Expanded(
-                  child: _lyrics
-                      ? LyricsView(s)
-                      : Center(child: TrackArt(track: s, size: 280)),
+          child: Scaffold(
+            backgroundColor: Colors.transparent,
+            appBar: AppBar(
+              backgroundColor: Colors.transparent,
+              title: Text(tr('Reproduciendo', 'Now playing')),
+              actions: [
+                IconButton(
+                  icon: Icon(_lyrics ? Icons.album : Icons.lyrics_outlined),
+                  tooltip: tr('Letra', 'Lyrics'),
+                  onPressed: () => setState(() => _lyrics = !_lyrics),
                 ),
-                const SizedBox(height: 8),
-                Text(
-                  s.title,
-                  style: Theme.of(context).textTheme.titleLarge,
-                  maxLines: 2,
-                  textAlign: TextAlign.center,
-                  overflow: TextOverflow.ellipsis,
+                IconButton(
+                  icon: const Icon(Icons.equalizer),
+                  tooltip: tr('Ecualizador', 'Equalizer'),
+                  onPressed: () => Navigator.push(
+                    context,
+                    MaterialPageRoute(builder: (_) => const EqualizerPage()),
+                  ),
                 ),
-                const SizedBox(height: 4),
-                Text(s.artist),
-                const SizedBox(height: 8),
-                StreamBuilder<Duration>(
-                  stream: p.positionStream,
-                  builder: (context, snap) {
-                    final pos = snap.data ?? Duration.zero;
-                    final dur = p.duration ?? Duration.zero;
-                    final max = dur.inMilliseconds > 0
-                        ? dur.inMilliseconds.toDouble()
-                        : 1.0;
-                    final val = pos.inMilliseconds
-                        .toDouble()
-                        .clamp(0.0, max)
-                        .toDouble();
-                    return Column(
-                      children: [
-                        Slider(
-                          value: val,
-                          max: max,
-                          onChanged: (v) =>
-                              p.seek(Duration(milliseconds: v.round())),
-                        ),
-                        Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 16),
-                          child: Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            children: [Text(fmt(pos)), Text(fmt(dur))],
-                          ),
-                        ),
-                      ],
-                    );
-                  },
-                ),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                  children: [
-                    StreamBuilder<bool>(
-                      stream: p.shuffleModeEnabledStream,
-                      builder: (context, snap) => IconButton(
-                        icon: Icon(
-                          Icons.shuffle,
-                          color: (snap.data ?? false)
-                              ? Theme.of(context).colorScheme.primary
-                              : null,
-                        ),
-                        onPressed: ctrl.toggleShuffle,
-                      ),
-                    ),
-                    IconButton(
-                      iconSize: 40,
-                      icon: const Icon(Icons.skip_previous),
-                      onPressed: p.seekToPrevious,
-                    ),
-                    const PlayPauseButton(size: 64),
-                    IconButton(
-                      iconSize: 40,
-                      icon: const Icon(Icons.skip_next),
-                      onPressed: p.seekToNext,
-                    ),
-                    StreamBuilder<LoopMode>(
-                      stream: p.loopModeStream,
-                      builder: (context, snap) {
-                        final m = snap.data ?? LoopMode.off;
-                        return IconButton(
-                          icon: Icon(
-                            m == LoopMode.one ? Icons.repeat_one : Icons.repeat,
-                            color: m == LoopMode.off
-                                ? null
-                                : Theme.of(context).colorScheme.primary,
-                          ),
-                          onPressed: ctrl.cycleRepeat,
-                        );
-                      },
-                    ),
-                  ],
-                ),
+                trackMenu(context, s),
               ],
+            ),
+            body: Padding(
+              padding: const EdgeInsets.all(24),
+              child: Column(
+                children: [
+                  Expanded(
+                    child: _lyrics
+                        ? LyricsView(s)
+                        : GestureDetector(
+                            onHorizontalDragEnd: (d) {
+                              final v = d.primaryVelocity ?? 0;
+                              if (v < -200) p.seekToNext();
+                              if (v > 200) p.seekToPrevious();
+                            },
+                            child: Center(
+                              child: Container(
+                                decoration: BoxDecoration(
+                                  borderRadius: BorderRadius.circular(22),
+                                  boxShadow: [
+                                    BoxShadow(
+                                      color: glow.withAlpha(140),
+                                      blurRadius: 40,
+                                      spreadRadius: 2,
+                                    ),
+                                  ],
+                                ),
+                                child: TrackArt(
+                                    track: s, size: 290, radius: 22),
+                              ),
+                            ),
+                          ),
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    s.title,
+                    style: Theme.of(context).textTheme.titleLarge,
+                    maxLines: 2,
+                    textAlign: TextAlign.center,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  const SizedBox(height: 4),
+                  Text(s.artist),
+                  const SizedBox(height: 8),
+                  StreamBuilder<Duration>(
+                    stream: p.positionStream,
+                    builder: (context, snap) {
+                      final pos = snap.data ?? Duration.zero;
+                      final dur = p.duration ?? Duration.zero;
+                      final max = dur.inMilliseconds > 0
+                          ? dur.inMilliseconds.toDouble()
+                          : 1.0;
+                      final val = pos.inMilliseconds
+                          .toDouble()
+                          .clamp(0.0, max)
+                          .toDouble();
+                      return Column(
+                        children: [
+                          Slider(
+                            value: val,
+                            max: max,
+                            onChanged: (v) =>
+                                p.seek(Duration(milliseconds: v.round())),
+                          ),
+                          Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 16),
+                            child: Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              children: [Text(fmt(pos)), Text(fmt(dur))],
+                            ),
+                          ),
+                        ],
+                      );
+                    },
+                  ),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                    children: [
+                      StreamBuilder<bool>(
+                        stream: p.shuffleModeEnabledStream,
+                        builder: (context, snap) => IconButton(
+                          icon: Icon(
+                            Icons.shuffle,
+                            color: (snap.data ?? false) ? cs.primary : null,
+                          ),
+                          onPressed: ctrl.toggleShuffle,
+                        ),
+                      ),
+                      IconButton(
+                        iconSize: 40,
+                        icon: const Icon(Icons.skip_previous),
+                        onPressed: p.seekToPrevious,
+                      ),
+                      const PlayPauseButton(size: 64),
+                      IconButton(
+                        iconSize: 40,
+                        icon: const Icon(Icons.skip_next),
+                        onPressed: p.seekToNext,
+                      ),
+                      StreamBuilder<LoopMode>(
+                        stream: p.loopModeStream,
+                        builder: (context, snap) {
+                          final m = snap.data ?? LoopMode.off;
+                          return IconButton(
+                            icon: Icon(
+                              m == LoopMode.one
+                                  ? Icons.repeat_one
+                                  : Icons.repeat,
+                              color: m == LoopMode.off ? null : cs.primary,
+                            ),
+                            onPressed: ctrl.cycleRepeat,
+                          );
+                        },
+                      ),
+                    ],
+                  ),
+                ],
+              ),
             ),
           ),
         );
@@ -1769,7 +2489,7 @@ class _LyricsViewState extends State<LyricsView> {
       future: _f,
       builder: (context, snap) {
         if (snap.connectionState != ConnectionState.done) {
-          return const Center(child: CircularProgressIndicator());
+          return const MusicLoader();
         }
         final l = snap.data;
         if (l == null) {
@@ -1861,71 +2581,347 @@ class _LyricsViewState extends State<LyricsView> {
 }
 
 // ===========================================================================
-// ECUALIZADOR
+// ECUALIZADOR PROFESIONAL
 // ===========================================================================
-class EqualizerPage extends StatelessWidget {
+class _CurvePainter extends CustomPainter {
+  final List<double> g;
+  final double minDb;
+  final double maxDb;
+  final Color color;
+  _CurvePainter(this.g, this.minDb, this.maxDb, this.color);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (g.isEmpty) return;
+    final n = g.length;
+    final range = (maxDb - minDb) == 0 ? 1.0 : (maxDb - minDb);
+    double yOf(double v) => size.height * (1 - (v - minDb) / range);
+    final zero = yOf(0);
+    canvas.drawLine(
+      Offset(0, zero),
+      Offset(size.width, zero),
+      Paint()
+        ..color = color.withAlpha(60)
+        ..strokeWidth = 1,
+    );
+    final pts = [
+      for (var i = 0; i < n; i++)
+        Offset(size.width * (i + 0.5) / n, yOf(g[i])),
+    ];
+    final path = Path()..moveTo(0, pts.first.dy);
+    path.lineTo(pts.first.dx, pts.first.dy);
+    for (var i = 0; i < n - 1; i++) {
+      final mid = (pts[i].dx + pts[i + 1].dx) / 2;
+      path.cubicTo(mid, pts[i].dy, mid, pts[i + 1].dy, pts[i + 1].dx,
+          pts[i + 1].dy);
+    }
+    path.lineTo(size.width, pts.last.dy);
+    final fill = Path.from(path)
+      ..lineTo(size.width, size.height)
+      ..lineTo(0, size.height)
+      ..close();
+    canvas.drawPath(
+      fill,
+      Paint()
+        ..shader = LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [color.withAlpha(110), color.withAlpha(8)],
+        ).createShader(Offset.zero & size),
+    );
+    canvas.drawPath(
+      path,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 3
+        ..strokeCap = StrokeCap.round
+        ..color = color,
+    );
+    for (final p in pts) {
+      canvas.drawCircle(p, 4.5, Paint()..color = color);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
+}
+
+class EqualizerPage extends StatefulWidget {
   const EqualizerPage({super.key});
+  @override
+  State<EqualizerPage> createState() => _EqualizerPageState();
+}
+
+class _EqualizerPageState extends State<EqualizerPage> {
+  AndroidEqualizerParameters? _params;
+  List<double> _gains = [];
+  double _loud = 0;
+  String _preset = '';
+  bool _failed = false;
+
+  static const _presets = <String, List<double>>{
+    'normal': [0, 0, 0, 0, 0],
+    'bass': [7, 5, 1, 0, 0],
+    'rock': [5, 3, -2, 3, 5],
+    'pop': [-1, 2, 4, 2, -1],
+    'jazz': [3, 1, -2, 2, 4],
+    'classic': [3, 2, -1, 2, 3],
+    'vocal': [-2, 0, 4, 3, 1],
+    'electro': [6, 4, 0, 3, 5],
+  };
+
+  String _presetName(String k) {
+    switch (k) {
+      case 'normal':
+        return 'Normal';
+      case 'bass':
+        return tr('Más graves', 'Bass boost');
+      case 'rock':
+        return 'Rock';
+      case 'pop':
+        return 'Pop';
+      case 'jazz':
+        return 'Jazz';
+      case 'classic':
+        return tr('Clásica', 'Classical');
+      case 'vocal':
+        return tr('Voces', 'Vocal');
+      default:
+        return tr('Electrónica', 'Electronic');
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    if (ctrl.queue.isNotEmpty) _load();
+  }
+
+  Future<void> _load() async {
+    try {
+      final p = await ctrl.equalizer.parameters
+          .timeout(const Duration(seconds: 8));
+      var loud = 0.0;
+      try {
+        final m =
+            jsonDecode(ctrl.prefs.getString('eq') ?? '{}') as Map<String, dynamic>;
+        loud = (m['lg'] as num?)?.toDouble() ?? 0;
+      } catch (_) {}
+      await ctrl.equalizer.setEnabled(ctrl.eqOn);
+      if (!mounted) return;
+      setState(() {
+        _params = p;
+        _gains = p.bands.map((b) => b.gain).toList();
+        _loud = loud;
+      });
+    } catch (_) {
+      if (mounted) setState(() => _failed = true);
+    }
+  }
+
+  void _save() {
+    ctrl.saveEq(_gains, _loud);
+    setState(() {});
+  }
+
+  void _setBand(int i, double v) {
+    _gains[i] = v;
+    _params!.bands[i].setGain(v);
+    _preset = '';
+    if (!ctrl.eqOn) ctrl.setEqEnabled(true);
+    _save();
+  }
+
+  void _applyPreset(String key) {
+    final v = _presets[key]!;
+    final n = _params!.bands.length;
+    for (var i = 0; i < n; i++) {
+      final idx = n == 1 ? 0 : (i * (v.length - 1) / (n - 1)).round();
+      final g = v[idx]
+          .clamp(_params!.minDecibels, _params!.maxDecibels)
+          .toDouble();
+      _gains[i] = g;
+      _params!.bands[i].setGain(g);
+    }
+    _preset = key;
+    if (!ctrl.eqOn) ctrl.setEqEnabled(true);
+    _save();
+  }
 
   String _hz(double f) =>
-      f >= 1000 ? '${(f / 1000).toStringAsFixed(1)} kHz' : '${f.round()} Hz';
+      f >= 1000 ? '${(f / 1000).toStringAsFixed(f >= 10000 ? 0 : 1)}k' : '${f.round()}';
 
   @override
   Widget build(BuildContext context) {
-    final eq = ctrl.equalizer;
-    return Scaffold(
-      appBar: AppBar(title: Text(tr('Ecualizador', 'Equalizer'))),
-      body: ctrl.queue.isEmpty
-          ? Center(
-              child: Text(tr('Primero pon una canción y vuelve aquí.',
-                  'Play a song first and come back here.')),
-            )
-          : FutureBuilder<AndroidEqualizerParameters>(
-              future: eq.parameters,
-              builder: (context, snap) {
-                final params = snap.data;
-                if (params == null) {
-                  return const Center(child: CircularProgressIndicator());
-                }
-                return ListView(
-                  padding: const EdgeInsets.all(16),
-                  children: [
-                    StreamBuilder<bool>(
-                      stream: eq.enabledStream,
-                      builder: (context, s) => SwitchListTile(
-                        title: Text(tr('Activar ecualizador', 'Enable equalizer')),
-                        value: s.data ?? false,
-                        onChanged: eq.setEnabled,
-                      ),
-                    ),
-                    for (final band in params.bands)
-                      StreamBuilder<double>(
-                        stream: band.gainStream,
-                        builder: (context, s) => Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(_hz(band.centerFrequency)),
-                            Slider(
-                              min: params.minDecibels,
-                              max: params.maxDecibels,
-                              value: s.data ?? band.gain,
-                              onChanged: band.setGain,
-                            ),
-                          ],
-                        ),
-                      ),
-                    TextButton.icon(
-                      onPressed: () {
-                        for (final b in params.bands) {
-                          b.setGain(0);
-                        }
-                      },
-                      icon: const Icon(Icons.restart_alt),
-                      label: Text(tr('Restablecer', 'Reset')),
-                    ),
-                  ],
-                );
+    final cs = Theme.of(context).colorScheme;
+    final p = _params;
+    Widget body;
+    if (ctrl.queue.isEmpty) {
+      body = Center(
+        child: Text(tr('Primero pon una canción y vuelve aquí.',
+            'Play a song first and come back here.')),
+      );
+    } else if (_failed) {
+      body = Center(
+        child: Text(tr('Este teléfono no permite ecualizador.',
+            'This phone does not support an equalizer.')),
+      );
+    } else if (p == null) {
+      body = const MusicLoader();
+    } else {
+      body = ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          Card(
+            child: SwitchListTile(
+              secondary: const Icon(Icons.equalizer),
+              title: Text(tr('Ecualizador', 'Equalizer'),
+                  style: const TextStyle(fontWeight: FontWeight.bold)),
+              subtitle: Text(ctrl.eqOn
+                  ? tr('Activado', 'On')
+                  : tr('Apagado', 'Off')),
+              value: ctrl.eqOn,
+              onChanged: (v) {
+                ctrl.setEqEnabled(v);
+                setState(() {});
               },
             ),
+          ),
+          const SizedBox(height: 12),
+          SizedBox(
+            height: 40,
+            child: ListView(
+              scrollDirection: Axis.horizontal,
+              children: [
+                for (final k in _presets.keys)
+                  Padding(
+                    padding: const EdgeInsets.only(right: 8),
+                    child: ChoiceChip(
+                      label: Text(_presetName(k)),
+                      selected: _preset == k,
+                      onSelected: (_) => _applyPreset(k),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 12),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(12, 16, 12, 8),
+              child: SizedBox(
+                height: 110,
+                child: CustomPaint(
+                  painter: _CurvePainter(
+                      _gains, p.minDecibels, p.maxDecibels, cs.primary),
+                  size: Size.infinite,
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 4),
+              child: Row(
+                children: [
+                  for (var i = 0; i < p.bands.length; i++)
+                    Expanded(
+                      child: Column(
+                        children: [
+                          Text(
+                            '${_gains[i] > 0 ? '+' : ''}${_gains[i].toStringAsFixed(0)}',
+                            style: TextStyle(
+                                color: cs.primary,
+                                fontWeight: FontWeight.bold),
+                          ),
+                          SizedBox(
+                            height: 210,
+                            child: RotatedBox(
+                              quarterTurns: 3,
+                              child: Slider(
+                                min: p.minDecibels,
+                                max: p.maxDecibels,
+                                value: _gains[i]
+                                    .clamp(p.minDecibels, p.maxDecibels)
+                                    .toDouble(),
+                                onChanged: (v) => _setBand(i, v),
+                              ),
+                            ),
+                          ),
+                          Text(_hz(p.bands[i].centerFrequency),
+                              style: const TextStyle(fontSize: 12)),
+                          const Text('Hz', style: TextStyle(fontSize: 10)),
+                        ],
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      const Icon(Icons.volume_up),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(tr('Refuerzo de volumen', 'Volume boost'),
+                            style:
+                                const TextStyle(fontWeight: FontWeight.bold)),
+                      ),
+                      Text('+${_loud.toStringAsFixed(1)} dB'),
+                    ],
+                  ),
+                  Slider(
+                    min: 0,
+                    max: 8,
+                    divisions: 16,
+                    value: _loud,
+                    onChanged: (v) => setState(() => _loud = v),
+                    onChangeEnd: (v) async {
+                      try {
+                        await ctrl.loudness.setTargetGain(v);
+                        await ctrl.loudness.setEnabled(v > 0);
+                      } catch (_) {}
+                      _save();
+                    },
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Center(
+            child: TextButton.icon(
+              onPressed: () async {
+                for (var i = 0; i < p.bands.length; i++) {
+                  _gains[i] = 0;
+                  p.bands[i].setGain(0);
+                }
+                _loud = 0;
+                try {
+                  await ctrl.loudness.setTargetGain(0);
+                  await ctrl.loudness.setEnabled(false);
+                } catch (_) {}
+                _preset = 'normal';
+                _save();
+              },
+              icon: const Icon(Icons.restart_alt),
+              label: Text(tr('Restablecer todo', 'Reset all')),
+            ),
+          ),
+        ],
+      );
+    }
+    return Scaffold(
+      appBar: AppBar(title: Text(tr('Ecualizador', 'Equalizer'))),
+      body: body,
     );
   }
 }
@@ -1964,9 +2960,10 @@ class _VisualizerPageState extends State<VisualizerPage>
           return Column(
             children: [
               const SizedBox(height: 16),
-              if (t != null) TrackArt(track: t, size: 120),
+              if (t != null) TrackArt(track: t, size: 120, radius: 16),
               const SizedBox(height: 8),
-              if (t != null) Text(t.title, style: Theme.of(context).textTheme.titleMedium),
+              if (t != null)
+                Text(t.title, style: Theme.of(context).textTheme.titleMedium),
               Expanded(
                 child: AnimatedBuilder(
                   animation: _c,
@@ -2008,7 +3005,7 @@ class _VisualizerPageState extends State<VisualizerPage>
 }
 
 // ===========================================================================
-// MODO GIRATORIO: DISCO DE VINILO (al poner el teléfono en horizontal)
+// MODO GIRATORIO: DISCO DE VINILO (teléfono en horizontal)
 // ===========================================================================
 class _GroovePainter extends CustomPainter {
   @override
@@ -2094,71 +3091,83 @@ class _VinylViewState extends State<VinylView>
     final t = ctrl.current;
     if (t == null) return const SizedBox.shrink();
     final p = ctrl.player;
+    final glow = (ctrl.dynamicTheme && ctrl.coverColor != null)
+        ? ctrl.coverColor!
+        : const Color(0xFF7C3AED);
     return Scaffold(
       backgroundColor: Colors.black,
-      body: SafeArea(
-        child: Row(
-          children: [
-            Expanded(
-              child: LayoutBuilder(
-                builder: (context, box) {
-                  final d = min(box.maxWidth, box.maxHeight) * 0.9;
-                  return Center(
-                    child: RotationTransition(
-                      turns: _c,
-                      child: _disc(d, t),
-                    ),
-                  );
-                },
-              ),
-            ),
-            Expanded(
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Text(
-                      t.title,
-                      maxLines: 2,
-                      textAlign: TextAlign.center,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 22,
-                        fontWeight: FontWeight.bold,
+      body: Container(
+        decoration: BoxDecoration(
+          gradient: RadialGradient(
+            center: const Alignment(-0.5, 0),
+            radius: 1.1,
+            colors: [glow.withAlpha(120), Colors.black],
+          ),
+        ),
+        child: SafeArea(
+          child: Row(
+            children: [
+              Expanded(
+                child: LayoutBuilder(
+                  builder: (context, box) {
+                    final d = min(box.maxWidth, box.maxHeight) * 0.9;
+                    return Center(
+                      child: RotationTransition(
+                        turns: _c,
+                        child: _disc(d, t),
                       ),
-                    ),
-                    const SizedBox(height: 4),
-                    Text(t.artist,
-                        style: const TextStyle(color: Colors.white70)),
-                    const SizedBox(height: 16),
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        IconButton(
-                          iconSize: 40,
-                          color: Colors.white,
-                          icon: const Icon(Icons.skip_previous),
-                          onPressed: p.seekToPrevious,
-                        ),
-                        IconTheme(
-                          data: const IconThemeData(color: Colors.white),
-                          child: const PlayPauseButton(size: 64),
-                        ),
-                        IconButton(
-                          iconSize: 40,
-                          color: Colors.white,
-                          icon: const Icon(Icons.skip_next),
-                          onPressed: p.seekToNext,
-                        ),
-                      ],
-                    ),
-                  ],
+                    );
+                  },
                 ),
               ),
-            ),
-          ],
+              Expanded(
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Text(
+                        t.title,
+                        maxLines: 2,
+                        textAlign: TextAlign.center,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 22,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(t.artist,
+                          style: const TextStyle(color: Colors.white70)),
+                      const SizedBox(height: 16),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          IconButton(
+                            iconSize: 40,
+                            color: Colors.white,
+                            icon: const Icon(Icons.skip_previous),
+                            onPressed: p.seekToPrevious,
+                          ),
+                          IconTheme(
+                            data: const IconThemeData(color: Colors.white),
+                            child: const PlayPauseButton(size: 64),
+                          ),
+                          IconButton(
+                            iconSize: 40,
+                            color: Colors.white,
+                            icon: const Icon(Icons.skip_next),
+                            onPressed: p.seekToNext,
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -2200,7 +3209,6 @@ class _SearchPageState extends State<SearchPage> {
       appBar: AppBar(
         title: TextField(
           controller: _t,
-          autofocus: false,
           decoration: InputDecoration(
             hintText: tr('Buscar canciones o sitios', 'Search songs or sites'),
             border: InputBorder.none,
@@ -2417,6 +3425,25 @@ class SettingsPage extends StatelessWidget {
           appBar: AppBar(title: Text(tr('Ajustes', 'Settings'))),
           body: ListView(
             children: [
+              Padding(
+                padding: const EdgeInsets.all(16),
+                child: Row(
+                  children: [
+                    const PlayLogo(size: 56),
+                    const SizedBox(width: 14),
+                    Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text('Play Music',
+                            style: TextStyle(
+                                fontSize: 20, fontWeight: FontWeight.bold)),
+                        Text(tr('Tu música. Sin anuncios.',
+                            'Your music. No ads.')),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
               _section(context, tr('Reproducción', 'Playback')),
               SwitchListTile(
                 title: Text(tr('Recordar aleatorio y repetir',
@@ -2468,6 +3495,14 @@ class SettingsPage extends StatelessWidget {
                 onTap: () => showSleepDialog(context),
               ),
               _section(context, tr('Apariencia', 'Appearance')),
+              SwitchListTile(
+                title: Text(tr('Colores según la carátula',
+                    'Colors from the album art')),
+                subtitle: Text(tr('La app cambia de color con cada canción',
+                    'The app changes color with each song')),
+                value: ctrl.dynamicTheme,
+                onChanged: ctrl.setDynamic,
+              ),
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 16),
                 child: SizedBox(
@@ -2548,11 +3583,13 @@ class SettingsPage extends StatelessWidget {
               _section(context, tr('Notificaciones', 'Notifications')),
               ListTile(
                 leading: const Icon(Icons.notifications),
-                title: Text(tr('Configuración de notificaciones',
-                    'Notification settings')),
-                subtitle: Text(tr('Abre los ajustes de Android para esta app',
-                    'Opens Android settings for this app')),
+                title: Text(tr('Notificación del reproductor',
+                    'Player notification')),
+                subtitle: Text(tr(
+                    'Si no aparece en la barra, permite las notificaciones aquí',
+                    'If it does not show in the bar, allow notifications here')),
                 onTap: () async {
+                  await ctrl.requestNotifications();
                   try {
                     await AppSettings.openAppSettings(
                         type: AppSettingsType.notification);
@@ -2595,7 +3632,8 @@ class HiddenPage extends StatelessWidget {
         return Scaffold(
           appBar: AppBar(title: Text(tr('Archivos ocultos', 'Hidden files'))),
           body: list.isEmpty
-              ? Center(child: Text(tr('No hay archivos ocultos', 'No hidden files')))
+              ? Center(
+                  child: Text(tr('No hay archivos ocultos', 'No hidden files')))
               : ListView.builder(
                   itemCount: list.length,
                   itemBuilder: (context, i) => ListTile(
@@ -2645,17 +3683,17 @@ class DeletedPage extends StatelessWidget {
                           onPressed: () => ctrl.restore(list[i].id),
                         ),
                         IconButton(
-                          tooltip: tr('Borrar para siempre', 'Delete forever'),
+                          tooltip: tr('Borrar el archivo', 'Delete the file'),
                           icon: const Icon(Icons.delete_forever),
                           onPressed: () async {
-                            final ok = await ctrl.deleteForever(list[i]);
-                            if (!ok && context.mounted) {
-                              snack(
-                                context,
-                                tr('Android no me deja borrar este archivo. Sigue oculto en tu app.',
-                                    'Android does not let me delete this file. It stays hidden in your app.'),
-                              );
-                            }
+                            final ok = await ctrl.deleteFile(list[i]);
+                            snack(
+                              context,
+                              ok
+                                  ? tr('Archivo borrado.', 'File deleted.')
+                                  : tr('Android no me deja borrar este archivo. Sigue oculto en tu app.',
+                                      'Android does not let me delete this file. It stays hidden in your app.'),
+                            );
                           },
                         ),
                       ],
