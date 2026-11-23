@@ -7,6 +7,7 @@ import 'dart:ui' as ui;
 import 'package:app_settings/app_settings.dart';
 import 'package:audio_service/audio_service.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart' show ScrollDirection;
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:just_audio/just_audio.dart';
@@ -20,13 +21,25 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:video_player/video_player.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
+import 'cosmetics_catalog.dart';
+import 'effects.dart';
+import 'progress.dart';
+import 'rewards_page.dart';
+
 late PlayMusicHandler audioHandler;
+final navKey = GlobalKey<NavigatorState>();
+
+void openRewards() {
+  navKey.currentState
+      ?.push(MaterialPageRoute(builder: (_) => const RewardsPage()));
+}
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await ctrl.init();
+  await progress.init();
   audioHandler = await AudioService.init(
-    builder: () => PlayMusicHandler(ctrl.player, ctrl.artFile),
+    builder: () => PlayMusicHandler(ctrl.player, ctrl.artForItem),
     config: AudioServiceConfig(
       androidNotificationChannelId: 'com.mimusica.audio',
       androidNotificationChannelName: 'Play Music',
@@ -46,10 +59,10 @@ Future<void> main() async {
 // ===========================================================================
 class PlayMusicHandler extends BaseAudioHandler {
   final AudioPlayer _p;
-  final Future<String?> Function(int msId) _artFile;
+  final Future<String?> Function(MediaItem item) _artFor;
   List<MediaItem> _items = [];
 
-  PlayMusicHandler(this._p, this._artFile) {
+  PlayMusicHandler(this._p, this._artFor) {
     _p.playbackEventStream.listen((_) => _emit());
     _p.playingStream.listen((_) => _emit());
     _p.currentIndexStream.listen(_onIndex);
@@ -61,21 +74,52 @@ class PlayMusicHandler extends BaseAudioHandler {
     });
   }
 
-  /// Le pasa a Android la lista de canciones que están en la cola.
-  void setItems(List<MediaItem> items) {
+  List<MediaControl> get _controls => [
+        MediaControl.skipToPrevious,
+        if (_p.playing) MediaControl.pause else MediaControl.play,
+        MediaControl.skipToNext,
+      ];
+
+  /// Arranca una cola nueva y publica YA la canción y los controles,
+  /// para que la notificación nunca salga vacía mientras carga el audio.
+  void begin(List<MediaItem> items, int index) {
     _items = List.of(items);
     queue.add(_items);
+    if (index >= 0 && index < _items.length) {
+      mediaItem.add(_items[index]);
+      _loadArt(index);
+    }
+    playbackState.add(PlaybackState(
+      controls: [
+        MediaControl.skipToPrevious,
+        MediaControl.pause,
+        MediaControl.skipToNext,
+      ],
+      systemActions: const {MediaAction.seek},
+      androidCompactActionIndices: const [0, 1, 2],
+      processingState: AudioProcessingState.loading,
+      playing: true,
+      updatePosition: Duration.zero,
+      speed: 1.0,
+      queueIndex: index,
+    ));
+  }
+
+  /// Vuelve a publicar la canción y el estado actuales.
+  void refresh() {
+    final i = _p.currentIndex;
+    if (i != null && i >= 0 && i < _items.length) {
+      mediaItem.add(_items[i]);
+      _loadArt(i);
+    }
+    _emit();
   }
 
   void _emit() => playbackState.add(_state());
 
   PlaybackState _state() {
     return PlaybackState(
-      controls: [
-        MediaControl.skipToPrevious,
-        if (_p.playing) MediaControl.pause else MediaControl.play,
-        MediaControl.skipToNext,
-      ],
+      controls: _controls,
       systemActions: const {MediaAction.seek},
       androidCompactActionIndices: const [0, 1, 2],
       processingState: const {
@@ -100,15 +144,16 @@ class PlayMusicHandler extends BaseAudioHandler {
     _emit();
   }
 
-  /// Guarda la carátula en un archivo temporal para mostrarla en la notificación.
+  /// Busca la carátula (local, internet o logo) y la agrega a la notificación.
   Future<void> _loadArt(int i) async {
+    if (i < 0 || i >= _items.length) return;
     final item = _items[i];
-    final id = item.extras?['msId'];
-    if (id is! int || item.artUri != null) return;
-    final path = await _artFile(id);
+    if (item.artUri != null) return;
+    final path = await _artFor(item);
     if (path == null || i >= _items.length || _items[i].id != item.id) return;
     _items[i] = _items[i].copyWith(artUri: Uri.file(path));
-    if (_p.currentIndex == i) mediaItem.add(_items[i]);
+    final cur = _p.currentIndex;
+    if (cur == i || cur == null) mediaItem.add(_items[i]);
   }
 
   @override
@@ -193,36 +238,43 @@ class LyricLine {
 class Lyrics {
   final List<LyricLine> lines;
   final bool synced;
-  Lyrics(this.lines, this.synced);
+  final int diffMs; // diferencia de duración con la versión de la letra (-1 = no se sabe)
+  Lyrics(this.lines, this.synced, {this.diffMs = -1});
 }
 
-Lyrics? parseLyrics(String raw) {
-  final re = RegExp(r'\[(\d+):(\d+(?:\.\d+)?)\]');
+/// Lee texto LRC: [mm:ss.xx], varias marcas por línea, etiqueta [offset:],
+/// marcas por palabra <mm:ss.xx> y letra simple sin tiempos.
+Lyrics? parseLyrics(String raw, {int diffMs = -1}) {
+  final re = RegExp(r'\[(\d+):(\d+(?:[.:]\d+)?)\]');
   final tag = RegExp(r'^\[[a-zA-Z]+:');
+  final word = RegExp(r'<\d+:\d+(?:[.:]\d+)?>');
+  final off = RegExp(r'\[offset:\s*([+-]?\d+)\s*\]', caseSensitive: false);
+  final om = off.firstMatch(raw);
+  final offsetMs = om == null ? 0 : int.parse(om.group(1)!);
   final timed = <LyricLine>[];
   final plain = <LyricLine>[];
   for (final l in raw.split('\n')) {
     final ms = re.allMatches(l).toList();
     if (ms.isEmpty) {
-      final txt = l.trim();
+      final txt = l.replaceAll(word, '').trim();
       if (txt.isNotEmpty && !tag.hasMatch(txt)) {
         plain.add(LyricLine(Duration.zero, txt));
       }
       continue;
     }
-    final text = l.replaceAll(re, '').trim();
+    final text = l.replaceAll(re, '').replaceAll(word, '').trim();
     for (final m in ms) {
       final min = int.parse(m.group(1)!);
-      final sec = double.parse(m.group(2)!);
-      timed.add(LyricLine(
-          Duration(milliseconds: ((min * 60 + sec) * 1000).round()), text));
+      final sec = double.parse(m.group(2)!.replaceFirst(':', '.'));
+      final t = ((min * 60 + sec) * 1000).round() - offsetMs;
+      timed.add(LyricLine(Duration(milliseconds: t < 0 ? 0 : t), text));
     }
   }
   if (timed.isNotEmpty) {
     timed.sort((a, b) => a.time.compareTo(b.time));
-    return Lyrics(timed, true);
+    return Lyrics(timed, true, diffMs: diffMs);
   }
-  if (plain.isNotEmpty) return Lyrics(plain, false);
+  if (plain.isNotEmpty) return Lyrics(plain, false, diffMs: diffMs);
   return null;
 }
 
@@ -325,6 +377,9 @@ class Controller extends ChangeNotifier {
   double speed = 1.0;
   String sortMode = 'az';
   double dynIntensity = 0.75;
+  bool remoteArtOn = true;
+  final Map<int, String> remoteById = {};
+  final Set<String> _remoteMiss = {};
   int bgDim = 40;
   bool notifOk = true;
   bool notifBannerHidden = false;
@@ -350,6 +405,7 @@ class Controller extends ChangeNotifier {
     speed = prefs.getDouble('speed') ?? 1.0;
     sortMode = prefs.getString('sort') ?? 'az';
     dynIntensity = prefs.getDouble('dynIntensity') ?? 0.75;
+    remoteArtOn = prefs.getBool('remoteArt') ?? true;
     bgDim = prefs.getInt('bgDim') ?? 40;
     notifBannerHidden = prefs.getBool('notifBanner') ?? false;
     final st = prefs.getString('sites');
@@ -441,6 +497,154 @@ class Controller extends ChangeNotifier {
     } catch (_) {
       return null;
     }
+  }
+
+  /// Para que otros módulos (como la tienda) pidan redibujar la app.
+  void refreshUi() => notifyListeners();
+
+  void setRemoteArt(bool v) {
+    remoteArtOn = v;
+    prefs.setBool('remoteArt', v);
+    notifyListeners();
+  }
+
+  /// Carátula para la notificación: 1) la del archivo, 2) una de internet,
+  /// 3) el logo de la app. Siempre devuelve una imagen si es posible.
+  Future<String?> artForItem(MediaItem item) async {
+    final id = item.extras?['msId'];
+    if (id is int) {
+      final p = await artFile(id);
+      if (p != null) return p;
+    }
+    if (remoteArtOn) {
+      final p = await _remoteArt(item);
+      if (p != null) return p;
+    }
+    return logoArtFile();
+  }
+
+  Future<String?> _remoteArt(MediaItem item) async {
+    try {
+      final dir = await getTemporaryDirectory();
+      final f = File('${dir.path}/art_r_${item.id}.jpg');
+      final tid = int.tryParse(item.id);
+      if (await f.exists() && await f.length() > 0) {
+        if (tid != null && remoteById[tid] != f.path) {
+          remoteById[tid] = f.path;
+          notifyListeners();
+        }
+        return f.path;
+      }
+      if (_remoteMiss.contains(item.id)) return null;
+      final title = item.title
+          .replaceAll(RegExp(r'[\(\[].*?[\)\]]'), ' ')
+          .replaceAll(RegExp(r'\s+'), ' ')
+          .trim();
+      final a = item.artist ?? '';
+      final artist =
+          (a == tr('Desconocido', 'Unknown') || a == tr('Descargas', 'Downloads'))
+              ? ''
+              : a;
+      final term = '$artist $title'.trim();
+      if (term.isEmpty) return null;
+      final client = HttpClient();
+      try {
+        final u = Uri.https('itunes.apple.com', '/search',
+            {'term': term, 'media': 'music', 'entity': 'song', 'limit': '1'});
+        final req = await client.getUrl(u);
+        req.headers.set('User-Agent', 'PlayMusic/5.0');
+        final res = await req.close().timeout(const Duration(seconds: 12));
+        if (res.statusCode != 200) {
+          _remoteMiss.add(item.id);
+          return null;
+        }
+        final data = jsonDecode(await res.transform(utf8.decoder).join());
+        final results = data['results'];
+        if (results is! List || results.isEmpty) {
+          _remoteMiss.add(item.id);
+          return null;
+        }
+        // evita imágenes de otra canción: debe compartir alguna palabra del título
+        final tn = (results[0]['trackName'] ?? '').toString().toLowerCase();
+        final words = title.toLowerCase().split(' ').where((w) => w.length >= 3);
+        if (words.isNotEmpty && !words.any(tn.contains)) {
+          _remoteMiss.add(item.id);
+          return null;
+        }
+        final url = results[0]['artworkUrl100'];
+        if (url is! String) {
+          _remoteMiss.add(item.id);
+          return null;
+        }
+        final big = url.replaceAll('100x100bb', '600x600bb');
+        final res2 = await (await client.getUrl(Uri.parse(big)))
+            .close()
+            .timeout(const Duration(seconds: 15));
+        if (res2.statusCode != 200) return null;
+        final bytes = <int>[];
+        await for (final c in res2) {
+          bytes.addAll(c);
+        }
+        if (bytes.isEmpty) return null;
+        await f.writeAsBytes(Uint8List.fromList(bytes), flush: true);
+        if (tid != null) {
+          remoteById[tid] = f.path;
+          notifyListeners();
+        }
+        return f.path;
+      } finally {
+        client.close();
+      }
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Imagen de respaldo: el logo de Play Music guardado como PNG.
+  Future<String?> logoArtFile() async {
+    try {
+      final dir = await getTemporaryDirectory();
+      final f = File('${dir.path}/art_logo.png');
+      if (await f.exists() && await f.length() > 0) return f.path;
+      final rec = ui.PictureRecorder();
+      _LogoPainter().paint(Canvas(rec), const Size(512, 512));
+      final img = await rec.endRecording().toImage(512, 512);
+      final bd = await img.toByteData(format: ui.ImageByteFormat.png);
+      if (bd == null) return null;
+      await f.writeAsBytes(bd.buffer.asUint8List(), flush: true);
+      return f.path;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Texto con el estado real de la notificación (para la pantalla de diagnóstico).
+  Future<String> notificationReport() async {
+    var perm = '?';
+    try {
+      perm = (await ph.Permission.notification.status).name;
+    } catch (_) {}
+    final mi = audioHandler.mediaItem.value;
+    final st = audioHandler.playbackState.value;
+    var art = '—';
+    final uri = mi?.artUri;
+    if (uri != null) {
+      try {
+        art = File(uri.toFilePath()).existsSync()
+            ? tr('sí (existe)', 'yes (exists)')
+            : tr('no existe', 'missing');
+      } catch (_) {
+        art = uri.toString();
+      }
+    }
+    return '${tr('Permiso de notificaciones', 'Notification permission')}: $perm\n'
+        '${tr('Canción en la sesión', 'Song in session')}: ${mi?.title ?? '—'}\n'
+        '${tr('Artista', 'Artist')}: ${mi?.artist ?? '—'}\n'
+        '${tr('Carátula lista', 'Artwork ready')}: $art\n'
+        '${tr('Controles', 'Controls')}: ${st.controls.length}\n'
+        '${tr('Reproduciendo', 'Playing')}: ${st.playing}\n'
+        '${tr('Estado', 'State')}: ${st.processingState.name}\n'
+        '${tr('Canciones en la cola', 'Songs in queue')}: ${audioHandler.queue.value.length}';
   }
 
   // Color vibrante listo para usar según la intensidad elegida
@@ -604,7 +808,7 @@ class Controller extends ChangeNotifier {
   Future<void> playList(List<Track> list, int index) async {
     if (list.isEmpty) return;
     queue = List.of(list);
-    audioHandler.setItems(queue
+    audioHandler.begin(queue
         .map((t) => MediaItem(
               id: '${t.id}',
               title: t.title,
@@ -613,7 +817,7 @@ class Controller extends ChangeNotifier {
                   t.durationMs > 0 ? Duration(milliseconds: t.durationMs) : null,
               extras: {'msId': t.msId},
             ))
-        .toList());
+        .toList(), index);
     final sources = queue.map((t) => AudioSource.uri(Uri.parse(t.uri))).toList();
     try {
       await player.setAudioSource(
@@ -917,10 +1121,23 @@ class Controller extends ChangeNotifier {
   }
 
   // ----- Letras -----
+  /// Ajuste fino por canción, en milisegundos (+ = la letra aparece antes).
+  int lyricOffset(int id) => prefs.getInt('lyroff_$id') ?? 0;
+
+  void setLyricOffset(int id, int ms) {
+    if (ms == 0) {
+      prefs.remove('lyroff_$id');
+    } else {
+      prefs.setInt('lyroff_$id', ms);
+    }
+  }
+
   Future<Lyrics?> loadLyrics(Track t, {bool forceOnline = false}) async {
     if (!forceOnline) {
       final saved = prefs.getString('lyr_${t.id}');
-      if (saved != null) return parseLyrics(saved);
+      if (saved != null) {
+        return parseLyrics(saved, diffMs: prefs.getInt('lyrdiff_${t.id}') ?? -1);
+      }
       try {
         final dot = t.path.lastIndexOf('.');
         final base = dot > 0 ? t.path.substring(0, dot) : t.path;
@@ -929,17 +1146,21 @@ class Controller extends ChangeNotifier {
       } catch (_) {}
       return null;
     }
-    final text = await _fetchOnline(t);
-    if (text == null) return null;
-    await prefs.setString('lyr_${t.id}', text);
-    return parseLyrics(text);
+    final r = await _fetchOnline(t);
+    if (r == null) return null;
+    await prefs.setString('lyr_${t.id}', r.key);
+    await prefs.setInt('lyrdiff_${t.id}', r.value);
+    return parseLyrics(r.key, diffMs: r.value);
   }
 
   Future<void> saveLyrics(Track t, String text) async {
     await prefs.setString('lyr_${t.id}', text);
+    await prefs.remove('lyrdiff_${t.id}');
   }
 
-  Future<String?> _fetchOnline(Track t) async {
+  /// Busca en lrclib y elige la versión cuya duración se parece más a la canción
+  /// (una versión distinta es la causa más común de letras desfasadas).
+  Future<MapEntry<String, int>?> _fetchOnline(Track t) async {
     final client = HttpClient();
     try {
       final params = <String, String>{'track_name': t.title};
@@ -947,21 +1168,35 @@ class Controller extends ChangeNotifier {
           t.artist != tr('Descargas', 'Downloads')) {
         params['artist_name'] = t.artist;
       }
+      final dur = t.durationMs > 0
+          ? t.durationMs
+          : (current?.id == t.id ? (player.duration?.inMilliseconds ?? 0) : 0);
       final u = Uri.https('lrclib.net', '/api/search', params);
       final req = await client.getUrl(u);
-      req.headers.set('User-Agent', 'PlayMusic/3.0');
+      req.headers.set('User-Agent', 'PlayMusic/5.0');
       final res = await req.close().timeout(const Duration(seconds: 15));
       if (res.statusCode != 200) return null;
       final body = await res.transform(utf8.decoder).join();
       final data = jsonDecode(body);
       if (data is! List || data.isEmpty) return null;
+      MapEntry<String, int>? best;
+      var bestDiff = 1 << 30;
       for (final item in data) {
         final s = item['syncedLyrics'];
-        if (s is String && s.trim().isNotEmpty) return s;
+        if (s is! String || s.trim().isEmpty) continue;
+        final d = item['duration'];
+        final dm = d is num ? (d * 1000).round() : 0;
+        final known = dur > 0 && dm > 0;
+        final diff = known ? (dm - dur).abs() : 0;
+        if (diff < bestDiff) {
+          bestDiff = diff;
+          best = MapEntry(s, known ? diff : -1);
+        }
       }
+      if (best != null) return best;
       for (final item in data) {
         final p = item['plainLyrics'];
-        if (p is String && p.trim().isNotEmpty) return p;
+        if (p is String && p.trim().isNotEmpty) return MapEntry(p, -1);
       }
       return null;
     } catch (_) {
@@ -970,7 +1205,6 @@ class Controller extends ChangeNotifier {
       client.close();
     }
   }
-
 }
 
 final ctrl = Controller();
@@ -979,7 +1213,7 @@ final ctrl = Controller();
 // APP Y PANTALLA PRINCIPAL
 // ===========================================================================
 ThemeData buildTheme(Brightness b) {
-  final seed = ctrl.glow ?? accents[ctrl.accent];
+  final seed = progress.themeColor ?? ctrl.glow ?? accents[ctrl.accent];
   return ThemeData(
     useMaterial3: true,
     colorScheme: ColorScheme.fromSeed(seedColor: seed, brightness: b),
@@ -999,6 +1233,7 @@ class PlayMusicApp extends StatelessWidget {
         title: 'Play Music',
         debugShowCheckedModeBanner: false,
         scaffoldMessengerKey: messengerKey,
+        navigatorKey: navKey,
         theme: _theme(Brightness.light),
         darkTheme: _theme(Brightness.dark),
         themeMode: ctrl.themeMode == 'light'
@@ -1101,6 +1336,8 @@ class _RootState extends State<Root> with WidgetsBindingObserver {
             fit: StackFit.expand,
             children: [
               _background(cs),
+              if (progress.particles != null)
+                Positioned.fill(child: ParticleField(style: progress.particles!)),
               DefaultTabController(
                 length: 5,
                 initialIndex: 1,
@@ -1410,9 +1647,26 @@ class TrackArt extends StatelessWidget {
         child: Icon(Icons.music_note, size: size * 0.5),
       );
 
+  Widget? _remote(BuildContext context) {
+    final p = ctrl.remoteById[track.id];
+    if (p == null) return null;
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(radius),
+      child: Image.file(
+        File(p),
+        width: size,
+        height: size,
+        fit: BoxFit.cover,
+        filterQuality: FilterQuality.high,
+        gaplessPlayback: true,
+        errorBuilder: (_, __, ___) => _ph(context),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    if (track.msId == null) return _ph(context);
+    if (track.msId == null) return _remote(context) ?? _ph(context);
     final dpr = MediaQuery.of(context).devicePixelRatio;
     final px = size > 100 ? 1000 : 300;
     Widget img(Uint8List b) => ClipRRect(
@@ -1432,14 +1686,17 @@ class TrackArt extends StatelessWidget {
     if (cached != null) return img(cached);
     return FutureBuilder<Uint8List?>(
       future: ctrl.art(track.msId!, px, quality: size > 100 ? 100 : 92),
-      builder: (context, s) => s.data != null ? img(s.data!) : _ph(context),
+      builder: (context, s) => s.data != null
+          ? img(s.data!)
+          : (_remote(context) ?? _ph(context)),
     );
   }
 }
 
 class PlayPauseButton extends StatelessWidget {
   final double size;
-  const PlayPauseButton({super.key, this.size = 32});
+  final bool styled;
+  const PlayPauseButton({super.key, this.size = 32, this.styled = false});
 
   @override
   Widget build(BuildContext context) {
@@ -1447,6 +1704,15 @@ class PlayPauseButton extends StatelessWidget {
       stream: ctrl.player.playingStream,
       builder: (context, snap) {
         final playing = snap.data ?? false;
+        final st = styled ? progress.button : null;
+        if (st != null) {
+          return StyledPlayButton(
+            style: st,
+            playing: playing,
+            size: size,
+            onTap: () => playing ? ctrl.player.pause() : ctrl.player.play(),
+          );
+        }
         return IconButton(
           iconSize: size,
           icon: Icon(playing ? Icons.pause_circle : Icons.play_circle),
@@ -2494,7 +2760,10 @@ class _NowPlayingPageState extends State<NowPlayingPage> {
         _syncTo(pos);
         return LayoutBuilder(
           builder: (context, box) {
-            final side = max(120.0, min(box.maxWidth * 0.82 - 20, box.maxHeight - 16));
+            final frame = progress.frame;
+            final extra = CoverFrame.extra(frame);
+            final side = max(
+                120.0, min(box.maxWidth * 0.82 - 20, box.maxHeight - 16) - extra);
             return PageView.builder(
               controller: _pc,
               itemCount: n,
@@ -2512,11 +2781,8 @@ class _NowPlayingPageState extends State<NowPlayingPage> {
                     if (_pc.hasClients && _pc.position.hasPixels) {
                       page = _pc.page ?? page;
                     }
-                    final d = (page - i).abs().clamp(0.0, 1.0).toDouble();
-                    return Transform.scale(
-                      scale: 1 - 0.16 * d,
-                      child: Opacity(opacity: 1 - 0.5 * d, child: child),
-                    );
+                    return cosTransition(progress.transition, page - i,
+                        child ?? const SizedBox.shrink());
                   },
                   child: Center(
                     child: Container(
@@ -2530,7 +2796,11 @@ class _NowPlayingPageState extends State<NowPlayingPage> {
                           ),
                         ],
                       ),
-                      child: TrackArt(track: t, size: side, radius: 22),
+                      child: CoverFrame(
+                        style: frame,
+                        radius: 22,
+                        child: TrackArt(track: t, size: side, radius: 22),
+                      ),
                     ),
                   ),
                 );
@@ -2573,7 +2843,10 @@ class _NowPlayingPageState extends State<NowPlayingPage> {
               ],
             ),
           ),
-          child: Scaffold(
+          child: Stack(children: [
+            if (progress.particles != null)
+              Positioned.fill(child: ParticleField(style: progress.particles!)),
+            Scaffold(
             backgroundColor: Colors.transparent,
             appBar: AppBar(
               backgroundColor: Colors.transparent,
@@ -2682,7 +2955,7 @@ class _NowPlayingPageState extends State<NowPlayingPage> {
                         icon: const Icon(Icons.skip_previous),
                         onPressed: p.seekToPrevious,
                       ),
-                      const PlayPauseButton(size: 64),
+                      const PlayPauseButton(size: 64, styled: true),
                       IconButton(
                         iconSize: 40,
                         icon: const Icon(Icons.skip_next),
@@ -2709,6 +2982,7 @@ class _NowPlayingPageState extends State<NowPlayingPage> {
               ),
             ),
           ),
+          ]),
         );
       },
     );
@@ -2716,7 +2990,7 @@ class _NowPlayingPageState extends State<NowPlayingPage> {
 }
 
 // ===========================================================================
-// LETRAS SINCRONIZADAS
+// LETRAS SINCRONIZADAS (precisas, con ajuste fino y respaldo sin tiempos)
 // ===========================================================================
 class LyricsView extends StatefulWidget {
   final Track track;
@@ -2726,44 +3000,137 @@ class LyricsView extends StatefulWidget {
 }
 
 class _LyricsViewState extends State<LyricsView> {
-  Future<Lyrics?>? _f;
+  Lyrics? _lyr;
+  bool _loading = true;
   bool _searching = false;
-  final _sc = ScrollController();
-  int _last = -1;
+  bool _follow = true;
+  int _offset = 0; // ms; positivo = la letra aparece antes
+  List<GlobalKey> _keys = [];
+  final ValueNotifier<int> _active = ValueNotifier<int>(-1);
+  final ScrollController _sc = ScrollController();
+  StreamSubscription<Duration>? _sub;
 
   @override
   void initState() {
     super.initState();
-    _f = ctrl.loadLyrics(widget.track);
+    _load();
+    // posición cada 40-80 ms (la normal solo avisa cada 200 ms)
+    _sub = ctrl.player
+        .createPositionStream(
+          minPeriod: const Duration(milliseconds: 40),
+          maxPeriod: const Duration(milliseconds: 80),
+        )
+        .listen(_onPos);
   }
 
   @override
   void didUpdateWidget(LyricsView old) {
     super.didUpdateWidget(old);
     if (old.track.id != widget.track.id) {
-      _last = -1;
-      _f = ctrl.loadLyrics(widget.track);
+      _loading = true;
+      _lyr = null;
+      _active.value = -1;
+      _load();
     }
   }
 
   @override
   void dispose() {
+    _sub?.cancel();
+    _active.dispose();
     _sc.dispose();
     super.dispose();
   }
 
+  Future<void> _load() async {
+    final t = widget.track;
+    final l = await ctrl.loadLyrics(t);
+    if (!mounted || widget.track.id != t.id) return;
+    _apply(l);
+  }
+
+  void _apply(Lyrics? l) {
+    setState(() {
+      _lyr = l;
+      _loading = false;
+      _active.value = -1;
+      _keys = l == null ? [] : List.generate(l.lines.length, (_) => GlobalKey());
+      _offset = ctrl.lyricOffset(widget.track.id);
+      _follow = true;
+    });
+  }
+
+  int _indexFor(Duration pos) {
+    final l = _lyr;
+    if (l == null || !l.synced) return -1;
+    final t = pos.inMilliseconds + _offset;
+    var lo = 0;
+    var hi = l.lines.length - 1;
+    var ans = -1;
+    while (lo <= hi) {
+      final mid = (lo + hi) >> 1;
+      if (l.lines[mid].time.inMilliseconds <= t) {
+        ans = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    return ans;
+  }
+
+  void _onPos(Duration pos) {
+    final l = _lyr;
+    if (!mounted || l == null) return;
+    if (l.synced) {
+      final i = _indexFor(pos);
+      if (i != _active.value) {
+        _active.value = i;
+        if (_follow) _scrollTo(i);
+      }
+    } else if (_follow && _sc.hasClients) {
+      final dur = ctrl.player.duration?.inMilliseconds ?? 0;
+      if (dur > 0) {
+        final f = (pos.inMilliseconds / dur).clamp(0.0, 1.0).toDouble();
+        _sc.jumpTo(f * _sc.position.maxScrollExtent);
+      }
+    }
+  }
+
+  void _scrollTo(int i) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || i < 0 || i >= _keys.length) return;
+      final c = _keys[i].currentContext;
+      if (c == null) return;
+      Scrollable.ensureVisible(
+        c,
+        alignment: 0.4,
+        duration: const Duration(milliseconds: 350),
+        curve: Curves.easeOutCubic,
+      );
+    });
+  }
+
+  void _bump(int d) {
+    setState(() => _offset += d);
+    ctrl.setLyricOffset(widget.track.id, _offset);
+    final i = _indexFor(ctrl.player.position);
+    _active.value = i;
+    if (_follow) _scrollTo(i);
+  }
+
   Future<void> _online() async {
     setState(() => _searching = true);
-    final l = await ctrl.loadLyrics(widget.track, forceOnline: true);
-    if (!mounted) return;
-    setState(() {
-      _searching = false;
-      _f = Future.value(l);
-    });
+    final t = widget.track;
+    final l = await ctrl.loadLyrics(t, forceOnline: true);
+    if (!mounted || widget.track.id != t.id) return;
+    setState(() => _searching = false);
     if (l == null) {
       snack(context, tr('No encontré letra para esta canción.',
           'No lyrics found for this song.'));
+      return;
     }
+    _apply(l);
   }
 
   Future<void> _paste() async {
@@ -2794,49 +3161,137 @@ class _LyricsViewState extends State<LyricsView> {
     );
     if (ok == true && t.text.trim().isNotEmpty) {
       await ctrl.saveLyrics(widget.track, t.text);
-      if (mounted) setState(() => _f = ctrl.loadLyrics(widget.track));
+      final l = await ctrl.loadLyrics(widget.track);
+      if (mounted) _apply(l);
     }
   }
 
-  @override
-  Widget build(BuildContext context) {
-    return FutureBuilder<Lyrics?>(
-      future: _f,
-      builder: (context, snap) {
-        if (snap.connectionState != ConnectionState.done) {
-          return const MusicLoader();
-        }
-        final l = snap.data;
-        if (l == null) {
-          return Center(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(tr('No hay letra guardada para esta canción.',
-                    'No lyrics saved for this song.')),
-                const SizedBox(height: 12),
-                FilledButton.icon(
-                  onPressed: _searching ? null : _online,
-                  icon: _searching
-                      ? const SizedBox(
-                          width: 16,
-                          height: 16,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.cloud_download),
-                  label: Text(tr('Buscar en internet', 'Search online')),
-                ),
-                TextButton(
-                  onPressed: _paste,
-                  child: Text(tr('Pegar letra manualmente', 'Paste lyrics')),
-                ),
-              ],
-            ),
-          );
-        }
-        if (!l.synced) {
-          return ListView(
+  Widget _empty() {
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(tr('No hay letra guardada para esta canción.',
+              'No lyrics saved for this song.')),
+          const SizedBox(height: 12),
+          FilledButton.icon(
+            onPressed: _searching ? null : _online,
+            icon: _searching
+                ? const SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.cloud_download),
+            label: Text(tr('Buscar en internet', 'Search online')),
+          ),
+          TextButton(
+            onPressed: _paste,
+            child: Text(tr('Pegar letra manualmente', 'Paste lyrics')),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _followButton() {
+    return Positioned(
+      right: 8,
+      bottom: 8,
+      child: FloatingActionButton.small(
+        onPressed: () {
+          setState(() => _follow = true);
+          _scrollTo(_active.value);
+        },
+        child: const Icon(Icons.my_location),
+      ),
+    );
+  }
+
+  Widget _synced(Lyrics l) {
+    return LayoutBuilder(
+      builder: (context, box) {
+        final cs = Theme.of(context).colorScheme;
+        return NotificationListener<UserScrollNotification>(
+          onNotification: (n) {
+            if (n.direction != ScrollDirection.idle && _follow) {
+              setState(() => _follow = false);
+            }
+            return false;
+          },
+          child: Stack(
             children: [
+              SingleChildScrollView(
+                controller: _sc,
+                padding: EdgeInsets.symmetric(
+                    vertical: box.maxHeight * 0.4, horizontal: 8),
+                child: ValueListenableBuilder<int>(
+                  valueListenable: _active,
+                  builder: (context, active, _) => Column(
+                    children: [
+                      for (var i = 0; i < l.lines.length; i++)
+                        GestureDetector(
+                          onTap: () => ctrl.player.seek(Duration(
+                              milliseconds:
+                                  max(0, l.lines[i].time.inMilliseconds - _offset))),
+                          child: Container(
+                            key: _keys[i],
+                            width: double.infinity,
+                            alignment: Alignment.center,
+                            padding: const EdgeInsets.symmetric(vertical: 8),
+                            child: AnimatedDefaultTextStyle(
+                              duration: const Duration(milliseconds: 250),
+                              textAlign: TextAlign.center,
+                              style: TextStyle(
+                                fontSize: i == active ? 22 : 17,
+                                fontWeight: i == active
+                                    ? FontWeight.bold
+                                    : FontWeight.normal,
+                                color: i == active
+                                    ? cs.primary
+                                    : cs.onSurface.withAlpha(i < active ? 110 : 160),
+                              ),
+                              child: Text(l.lines[i].text.isEmpty
+                                  ? '♪'
+                                  : l.lines[i].text),
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+              if (!_follow) _followButton(),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _plain(Lyrics l) {
+    return NotificationListener<UserScrollNotification>(
+      onNotification: (n) {
+        if (n.direction != ScrollDirection.idle && _follow) {
+          setState(() => _follow = false);
+        }
+        return false;
+      },
+      child: Stack(
+        children: [
+          ListView(
+            controller: _sc,
+            padding: const EdgeInsets.symmetric(vertical: 12),
+            children: [
+              Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: Text(
+                  tr('Letra sin tiempos: se desplaza según el avance de la canción.',
+                      'Lyrics without timestamps: they scroll with the song progress.'),
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(fontSize: 12),
+                ),
+              ),
               for (final line in l.lines)
                 Padding(
                   padding: const EdgeInsets.symmetric(vertical: 6),
@@ -2845,52 +3300,93 @@ class _LyricsViewState extends State<LyricsView> {
                       style: const TextStyle(fontSize: 18)),
                 ),
             ],
-          );
-        }
-        return StreamBuilder<Duration>(
-          stream: ctrl.player.positionStream,
-          builder: (context, ps) {
-            final pos = ps.data ?? Duration.zero;
-            var idx = 0;
-            for (var i = 0; i < l.lines.length; i++) {
-              if (l.lines[i].time <= pos) idx = i;
-            }
-            if (idx != _last) {
-              _last = idx;
-              WidgetsBinding.instance.addPostFrameCallback((_) {
-                if (_sc.hasClients) {
-                  final target = max(0.0, (idx - 2) * 44.0);
-                  _sc.animateTo(
-                    min(target, _sc.position.maxScrollExtent),
-                    duration: const Duration(milliseconds: 300),
-                    curve: Curves.easeOut,
-                  );
-                }
-              });
-            }
-            return ListView.builder(
-              controller: _sc,
-              itemExtent: 44,
-              itemCount: l.lines.length,
-              itemBuilder: (context, i) => Center(
-                child: Text(
-                  l.lines[i].text,
-                  maxLines: 2,
-                  textAlign: TextAlign.center,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontSize: i == idx ? 20 : 16,
-                    fontWeight: i == idx ? FontWeight.bold : FontWeight.normal,
-                    color: i == idx
-                        ? Theme.of(context).colorScheme.primary
-                        : null,
-                  ),
-                ),
-              ),
-            );
-          },
-        );
-      },
+          ),
+          if (!_follow) _followButton(),
+        ],
+      ),
+    );
+  }
+
+  Widget _offsetBar() {
+    final s = _offset / 1000;
+    final label = '${s >= 0 ? '+' : ''}${s.toStringAsFixed(1)} s';
+    return Column(
+      children: [
+        Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            IconButton(
+              tooltip: tr('Retrasar 0.5 s', 'Delay 0.5 s'),
+              icon: const Icon(Icons.keyboard_double_arrow_left),
+              onPressed: () => _bump(-500),
+            ),
+            IconButton(
+              tooltip: tr('Retrasar 0.1 s', 'Delay 0.1 s'),
+              icon: const Icon(Icons.chevron_left),
+              onPressed: () => _bump(-100),
+            ),
+            GestureDetector(
+              onLongPress: () => _bump(-_offset),
+              child: Text(label,
+                  style: const TextStyle(fontWeight: FontWeight.bold)),
+            ),
+            IconButton(
+              tooltip: tr('Adelantar 0.1 s', 'Advance 0.1 s'),
+              icon: const Icon(Icons.chevron_right),
+              onPressed: () => _bump(100),
+            ),
+            IconButton(
+              tooltip: tr('Adelantar 0.5 s', 'Advance 0.5 s'),
+              icon: const Icon(Icons.keyboard_double_arrow_right),
+              onPressed: () => _bump(500),
+            ),
+            IconButton(
+              tooltip: tr('Buscar otra letra', 'Find another lyric'),
+              icon: const Icon(Icons.cloud_download_outlined),
+              onPressed: _searching ? null : _online,
+            ),
+            IconButton(
+              tooltip: tr('Pegar letra', 'Paste lyrics'),
+              icon: const Icon(Icons.edit_note),
+              onPressed: _paste,
+            ),
+          ],
+        ),
+        Text(
+          tr('Si la letra llega tarde, adelántala (+). Mantén pulsado el valor para reiniciar.',
+              'If lyrics come late, advance them (+). Long-press the value to reset.'),
+          textAlign: TextAlign.center,
+          style: const TextStyle(fontSize: 11),
+        ),
+      ],
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading) return const MusicLoader();
+    final l = _lyr;
+    if (l == null) return _empty();
+    return Column(
+      children: [
+        if (l.diffMs > 3000)
+          Container(
+            width: double.infinity,
+            margin: const EdgeInsets.only(bottom: 6),
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: Theme.of(context).colorScheme.errorContainer.withAlpha(160),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: Text(
+              tr('Esta letra es de una versión que dura ~${(l.diffMs / 1000).round()} s distinto. Ajusta con las flechas o busca otra.',
+                  'These lyrics are from a version that differs by ~${(l.diffMs / 1000).round()} s. Adjust with the arrows or find another.'),
+              style: const TextStyle(fontSize: 12),
+            ),
+          ),
+        Expanded(child: l.synced ? _synced(l) : _plain(l)),
+        if (l.synced) _offsetBar(),
+      ],
     );
   }
 }
@@ -3242,7 +3738,7 @@ class _EqualizerPageState extends State<EqualizerPage> {
 }
 
 // ===========================================================================
-// VISUALIZADOR (animación decorativa que se mueve con la música)
+// VISUALIZADOR (animación que se mueve con la música; el estilo es un cosmético)
 // ===========================================================================
 class VisualizerPage extends StatefulWidget {
   const VisualizerPage({super.key});
@@ -3264,7 +3760,10 @@ class _VisualizerPageState extends State<VisualizerPage>
 
   @override
   Widget build(BuildContext context) {
-    final color = Theme.of(context).colorScheme.primary;
+    final primary = Theme.of(context).colorScheme.primary;
+    final st = progress.viz;
+    final c1 = st != null ? Color(st.c1) : primary;
+    final c2 = st != null ? Color(st.c2) : primary;
     return Scaffold(
       appBar: AppBar(title: Text(tr('Visualizador', 'Visualizer'))),
       body: StreamBuilder<bool>(
@@ -3280,32 +3779,22 @@ class _VisualizerPageState extends State<VisualizerPage>
               if (t != null)
                 Text(t.title, style: Theme.of(context).textTheme.titleMedium),
               Expanded(
-                child: AnimatedBuilder(
-                  animation: _c,
-                  builder: (context, _) => Row(
-                    crossAxisAlignment: CrossAxisAlignment.end,
-                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                    children: [
-                      for (int i = 0; i < 24; i++)
-                        Container(
-                          width: 8,
-                          height: playing
-                              ? 12 +
-                                  180 *
-                                      (0.5 +
-                                          0.5 *
-                                              sin(_c.value *
-                                                      2 *
-                                                      pi *
-                                                      (1 + i % 3) +
-                                                  i * 0.7))
-                              : 12,
-                          decoration: BoxDecoration(
-                            color: color,
-                            borderRadius: BorderRadius.circular(4),
-                          ),
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: RepaintBoundary(
+                    child: AnimatedBuilder(
+                      animation: _c,
+                      builder: (context, _) => CustomPaint(
+                        size: Size.infinite,
+                        painter: VizPainter(
+                          style: st?.a ?? 0,
+                          t: _c.value,
+                          playing: playing,
+                          c1: c1,
+                          c2: c2,
                         ),
-                    ],
+                      ),
+                    ),
                   ),
                 ),
               ),
@@ -3322,24 +3811,6 @@ class _VisualizerPageState extends State<VisualizerPage>
 // ===========================================================================
 // MODO GIRATORIO: DISCO DE VINILO (teléfono en horizontal)
 // ===========================================================================
-class _GroovePainter extends CustomPainter {
-  @override
-  void paint(Canvas canvas, Size size) {
-    final center = size.center(Offset.zero);
-    final r = size.width / 2;
-    final p = Paint()
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 1
-      ..color = Colors.white.withAlpha(28);
-    for (double k = 0.5; k < 0.98; k += 0.05) {
-      canvas.drawCircle(center, r * k, p);
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
-}
-
 class VinylView extends StatefulWidget {
   const VinylView({super.key});
   @override
@@ -3373,31 +3844,10 @@ class _VinylViewState extends State<VinylView>
   }
 
   Widget _disc(double d, Track t) {
-    return Container(
-      width: d,
-      height: d,
-      decoration: const BoxDecoration(
-        shape: BoxShape.circle,
-        gradient: RadialGradient(
-          colors: [Color(0xFF2B2B2B), Color(0xFF0A0A0A)],
-        ),
-        boxShadow: [BoxShadow(blurRadius: 20, color: Colors.black54)],
-      ),
-      child: Stack(
-        alignment: Alignment.center,
-        children: [
-          CustomPaint(size: Size(d, d), painter: _GroovePainter()),
-          TrackArt(track: t, size: d * 0.4, radius: d * 0.2),
-          Container(
-            width: d * 0.05,
-            height: d * 0.05,
-            decoration: const BoxDecoration(
-              color: Colors.black,
-              shape: BoxShape.circle,
-            ),
-          ),
-        ],
-      ),
+    return VinylDisc(
+      d: d,
+      skin: VinylSkin.fromCosmetic(progress.vinyl),
+      center: TrackArt(track: t, size: d * 0.4, radius: d * 0.2),
     );
   }
 
@@ -3748,6 +4198,42 @@ class _WebPageState extends State<WebPage> {
 // ===========================================================================
 // AJUSTES
 // ===========================================================================
+Future<void> showNotifDiagnostics(BuildContext context) async {
+  final report = await ctrl.notificationReport();
+  if (!context.mounted) return;
+  await showDialog<void>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: Text(tr('Diagnóstico de la notificación',
+          'Notification diagnostics')),
+      content: SingleChildScrollView(child: Text(report)),
+      actions: [
+        TextButton(
+          onPressed: () {
+            audioHandler.refresh();
+            Navigator.pop(ctx);
+          },
+          child: Text(tr('Reenviar', 'Re-send')),
+        ),
+        TextButton(
+          onPressed: () async {
+            await ctrl.checkNotifications(ask: true);
+            try {
+              await AppSettings.openAppSettings(
+                  type: AppSettingsType.notification);
+            } catch (_) {}
+          },
+          child: Text(tr('Permisos', 'Permissions')),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(ctx),
+          child: Text(tr('Cerrar', 'Close')),
+        ),
+      ],
+    ),
+  );
+}
+
 class SettingsPage extends StatelessWidget {
   const SettingsPage({super.key});
 
@@ -3781,12 +4267,36 @@ class SettingsPage extends StatelessWidget {
                         const Text('Play Music',
                             style: TextStyle(
                                 fontSize: 20, fontWeight: FontWeight.bold)),
-                        Text(tr('Tu música. Sin anuncios.',
-                            'Your music. No ads.')),
+                        Text(progress.title != null
+                            ? progress.name(progress.title!)
+                            : tr('Tu música. Sin anuncios.', 'Your music. No ads.')),
                       ],
                     ),
                   ],
                 ),
+              ),
+              ListenableBuilder(
+                listenable: progress,
+                builder: (context, _) {
+                  final next = progress.next;
+                  return Card(
+                    margin: const EdgeInsets.symmetric(horizontal: 12),
+                    color: Theme.of(context).colorScheme.primaryContainer,
+                    child: ListTile(
+                      leading: const Icon(Icons.emoji_events_outlined),
+                      title: Text(tr('Tienda y colección', 'Store and collection'),
+                          style: const TextStyle(fontWeight: FontWeight.bold)),
+                      subtitle: Text(
+                        '${progress.unlocked.length} / ${kCosmetics.length}'
+                        '${next == null ? '' : ' · ${tr('Próximo en', 'Next in')} ${fmtTime(progress.remaining(next))}'}',
+                      ),
+                      trailing: progress.fresh.isNotEmpty
+                          ? Badge(label: Text('${progress.fresh.length}'))
+                          : const Icon(Icons.chevron_right),
+                      onTap: openRewards,
+                    ),
+                  );
+                },
               ),
               _section(context, tr('Reproducción', 'Playback')),
               SwitchListTile(
@@ -3982,6 +4492,22 @@ class SettingsPage extends StatelessWidget {
                         type: AppSettingsType.notification);
                   } catch (_) {}
                 },
+              ),
+              ListTile(
+                leading: const Icon(Icons.bug_report_outlined),
+                title: Text(tr('Diagnóstico de la notificación',
+                    'Notification diagnostics')),
+                subtitle: Text(tr('Revisa permisos, carátula y controles',
+                    'Check permissions, artwork and controls')),
+                onTap: () => showNotifDiagnostics(context),
+              ),
+              SwitchListTile(
+                title: Text(tr('Buscar carátulas en internet',
+                    'Look up covers online')),
+                subtitle: Text(tr('Solo cuando una canción no tiene imagen',
+                    'Only when a song has no image')),
+                value: ctrl.remoteArtOn,
+                onChanged: ctrl.setRemoteArt,
               ),
               _section(context, tr('Idioma', 'Language')),
               Padding(
