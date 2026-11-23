@@ -92,7 +92,7 @@ jobs:
 
       - name: Copiar mis archivos
         run: |
-          cp main.dart lib/main.dart
+          cp *.dart lib/
           cp AndroidManifest.xml android/app/src/main/AndroidManifest.xml
 
       - name: Crear APK
